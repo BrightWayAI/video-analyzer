@@ -1,0 +1,21 @@
+# Video-to-Storyboard Analyzer Dependencies
+
+# Audio transcription
+openai-whisper>=20231117
+
+# Scene detection
+scenedetect[opencv]>=0.6.2
+
+# Claude Vision API
+anthropic>=0.39.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Video download from URLs
+yt-dlp>=2024.1.0
+
+# Note: FFmpeg must be installed separately via system package manager:
+#   macOS: brew install ffmpeg
+#   Ubuntu/Debian: apt-get install ffmpeg
+#   Windows: choco install ffmpeg

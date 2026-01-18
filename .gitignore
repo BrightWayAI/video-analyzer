@@ -1,0 +1,17 @@
+# Output files (user-generated)
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Whisper model cache
+*.pt

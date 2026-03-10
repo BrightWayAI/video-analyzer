@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.brightwayai/video-analyzer",
+  "description": "Analyze videos and generate storyboard breakdowns. Extract frames via scene detection, transcribe audio with Whisper, analyze visuals with Claude Vision, and compute 8-field stylistic fingerprints.",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registry_type": "pypi",
+      "identifier": "video-analyzer-mcp",
+      "version": "0.1.0"
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/BrightWayAI/video-analyzer",
+    "source": "github"
+  },
+  "tools": [
+    {
+      "name": "video_analyze",
+      "description": "Run full video analysis pipeline: download, extract frames, transcribe, visual analysis, fingerprint, storyboard output"
+    },
+    {
+      "name": "video_extract_frames",
+      "description": "Extract representative frames using scene detection or fixed intervals"
+    },
+    {
+      "name": "video_transcribe",
+      "description": "Transcribe video audio with OpenAI Whisper"
+    },
+    {
+      "name": "video_fingerprint",
+      "description": "Generate 8-field Stylistic Fingerprint v3 classification"
+    },
+    {
+      "name": "video_check_deps",
+      "description": "Verify all required dependencies are installed"
+    }
+  ]
+}

@@ -11,7 +11,6 @@ Requires: FFmpeg installed on the system, ANTHROPIC_API_KEY env var.
 
 import json
 import os
-import sys
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -20,14 +19,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
-# ---------------------------------------------------------------------------
-# Add parent directory so we can import the existing analyze_video module
-# ---------------------------------------------------------------------------
-_PARENT_DIR = str(Path(__file__).resolve().parent.parent.parent)
-if _PARENT_DIR not in sys.path:
-    sys.path.insert(0, _PARENT_DIR)
-
-import analyze_video as av
+from video_analyzer_mcp import analyze_video as av
 
 # ---------------------------------------------------------------------------
 # MCP Server

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Video-to-Storyboard Analyzer for Riptoes
+Video-to-Storyboard Analyzer
 
-Analyzes educational videos and outputs a shot-by-shot breakdown table.
-Helps reverse-engineer effective educational videos to inform storyboard creation.
+Analyzes videos and outputs a shot-by-shot breakdown table.
+Extracts frames, transcribes audio, analyzes visuals, and generates stylistic fingerprints.
 
 Usage:
     python analyze_video.py input.mp4 -o breakdown.md

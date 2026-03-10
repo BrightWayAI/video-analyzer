@@ -1,0 +1,30 @@
+[project]
+name = "video-analyzer-mcp"
+version = "0.1.0"
+description = "MCP server for video analysis - extracts frames, transcribes audio, analyzes visuals with Claude, and generates storyboard breakdowns"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Zach Wagner" }
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pydantic>=2.0.0",
+    "openai-whisper>=20231117",
+    "scenedetect[opencv]>=0.6.2",
+    "anthropic>=0.39.0",
+    "Pillow>=10.0.0",
+    "yt-dlp>=2024.1.0",
+    "python-docx>=1.0.0",
+]
+
+[project.scripts]
+video-analyzer-mcp = "video_analyzer_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["video_analyzer_mcp"]

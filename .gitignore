@@ -15,3 +15,14 @@ __pycache__/
 
 # Whisper model cache
 *.pt
+
+# Credentials
+cookies.txt
+
+# Local storyboard outputs
+storyboards/
+todays-storyboards/
+BLVD/
+
+# MCP server venv
+video-analyzer-mcp/.venv/

@@ -1,6 +1,6 @@
 [project]
 name = "video-analyzer-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for video analysis - extracts frames, transcribes audio, analyzes visuals with Claude, and generates storyboard breakdowns"
 readme = "README.md"
 requires-python = ">=3.10"

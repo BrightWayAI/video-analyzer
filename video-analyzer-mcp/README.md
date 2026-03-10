@@ -1,6 +1,6 @@
 # Video Analyzer MCP Server
 
-<!-- mcp-name: io.github.brightwayai/video-analyzer -->
+<!-- mcp-name: io.github.BrightWayAI/video-analyzer -->
 
 An MCP (Model Context Protocol) server that analyzes videos and generates storyboard breakdowns. Extract frames, transcribe audio, analyze visuals with Claude Vision, and compute stylistic fingerprints — all usable directly from Claude Desktop or Claude Code.
 

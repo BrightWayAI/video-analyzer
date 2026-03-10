@@ -1,13 +1,16 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
-  "name": "io.github.brightwayai/video-analyzer",
-  "description": "Analyze videos and generate storyboard breakdowns. Extract frames via scene detection, transcribe audio with Whisper, analyze visuals with Claude Vision, and compute 8-field stylistic fingerprints.",
-  "version": "0.1.0",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BrightWayAI/video-analyzer",
+  "description": "Analyze videos: extract frames, transcribe audio, generate storyboard breakdowns.",
+  "version": "0.1.1",
   "packages": [
     {
-      "registry_type": "pypi",
+      "registryType": "pypi",
       "identifier": "video-analyzer-mcp",
-      "version": "0.1.0"
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
     }
   ],
   "repository": {

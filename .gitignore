@@ -24,6 +24,7 @@ storyboards/
 todays-storyboards/
 BLVD/
 
-# MCP server venv
+# MCP server build artifacts
 video-analyzer-mcp/.venv/
 video-analyzer-mcp/dist/
+video-analyzer-mcp/.mcpregistry_*

@@ -16,13 +16,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Video",
 ]
-
-[project.urls]
-Homepage = "https://github.com/BrightWayAI/video-analyzer"
-Repository = "https://github.com/BrightWayAI/video-analyzer"
-
-[project.optional-dependencies]
-dev = ["build", "twine"]
 dependencies = [
     "mcp[cli]>=1.0.0",
     "pydantic>=2.0.0",
@@ -33,6 +26,13 @@ dependencies = [
     "yt-dlp>=2024.1.0",
     "python-docx>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/BrightWayAI/video-analyzer"
+Repository = "https://github.com/BrightWayAI/video-analyzer"
+
+[project.optional-dependencies]
+dev = ["build", "twine"]
 
 [project.scripts]
 video-analyzer-mcp = "video_analyzer_mcp.server:main"

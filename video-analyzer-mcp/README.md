@@ -22,11 +22,13 @@ An MCP (Model Context Protocol) server that analyzes videos and generates storyb
 
 ## Installation
 
-### From PyPI
+### From GitHub
 
 ```bash
-pip install video-analyzer-mcp
+pip install "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp"
 ```
+
+Install from GitHub for now: version 0.1.2 on PyPI installs mcp 2.x and crashes on startup.
 
 ### For Claude Desktop
 
@@ -37,7 +39,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   "mcpServers": {
     "video-analyzer": {
       "command": "uvx",
-      "args": ["video-analyzer-mcp"],
+      "args": ["--from", "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp", "video-analyzer-mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "your-key-here"
       }
@@ -49,7 +51,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ### For Claude Code
 
 ```bash
-claude mcp add video-analyzer -s user -- uvx video-analyzer-mcp
+claude mcp add video-analyzer -s user -- uvx --from "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp" video-analyzer-mcp
 ```
 
 ## Usage Examples

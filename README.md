@@ -17,7 +17,7 @@ This project includes an MCP (Model Context Protocol) server so you can use vide
 ### Install via Claude Code
 
 ```bash
-claude mcp add video-analyzer -s user -- uvx video-analyzer-mcp
+claude mcp add video-analyzer -s user -- uvx --from "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp" video-analyzer-mcp
 ```
 
 ### Install via Claude Desktop
@@ -29,7 +29,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "video-analyzer": {
       "command": "uvx",
-      "args": ["video-analyzer-mcp"],
+      "args": ["--from", "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp", "video-analyzer-mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "your-key-here"
       }

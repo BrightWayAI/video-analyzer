@@ -1890,7 +1890,9 @@ def process_video(
     interval: Optional[float] = None,
     output_format: str = "docx",
     cookies_file: Optional[str] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    output_base: Optional[str] = None,
+    max_duration: Optional[float] = None,
 ) -> str:
     """
     Main processing pipeline for video analysis.
@@ -1906,8 +1908,10 @@ def process_video(
         Path to generated output file
     """
     # Get script directory for output folder
-    script_dir = Path(__file__).parent.absolute()
-    output_base = script_dir / "output"
+    if output_base is None:
+        output_base = Path(__file__).parent.absolute() / "output"
+    else:
+        output_base = Path(output_base)
 
     # Create temp directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1936,6 +1940,10 @@ def process_video(
 
         # Get video duration and dimensions
         duration = get_video_duration(video_path)
+        if max_duration is not None and duration > max_duration:
+            raise ValueError(
+                f"Video is {duration:.0f}s long; the limit is {max_duration:.0f}s."
+            )
         width, height, orientation = get_video_dimensions(video_path)
         if verbose:
             print(f"Video duration: {duration:.1f} seconds")

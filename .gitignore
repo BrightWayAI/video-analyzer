@@ -28,3 +28,7 @@ BLVD/
 video-analyzer-mcp/.venv/
 video-analyzer-mcp/dist/
 video-analyzer-mcp/.mcpregistry_*
+
+# Slack MCP caches (workspace user/channel data)
+.users_cache.json
+.channels_cache_v2.json

@@ -62,6 +62,33 @@ Once installed, you can ask Claude:
 - **"What's the stylistic fingerprint of this video?"** — runs `video_fingerprint`
 - **"Check if video analyzer dependencies are installed"** — runs `video_check_deps`
 
+## Hosted mode (remote HTTP)
+
+`video-analyzer-mcp-http` serves the same tools over streamable HTTP at `/mcp`, for running behind a gateway such as mcprush. The hosted mode:
+
+- answers only requests with a valid `x-mcprush-token` header and returns 401 to everything else
+- accepts public `http(s)` video URLs only (no local paths, cookies files or output directories) and rejects private or local addresses
+- returns the storyboard as Markdown inline and keeps nothing on disk
+- caps video length and the number of jobs that run at once
+
+```bash
+docker build -t video-analyzer-mcp .
+docker run -p 8000:8000 \
+  -e MCPRUSH_TOKEN=mgw_... \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e VIDEO_ANALYZER_MAX_SECONDS=300 \
+  video-analyzer-mcp
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCPRUSH_TOKEN` | (required) | Gateway token; the server won't start without it |
+| `MCPRUSH_TOKEN_NEXT` | | Second token accepted during a rotation |
+| `ANTHROPIC_API_KEY` | (required) | Claude Vision calls, billed to the operator |
+| `PORT` | `8000` | Listen port |
+| `VIDEO_ANALYZER_MAX_SECONDS` | `600` | Longest video accepted |
+| `VIDEO_ANALYZER_MAX_CONCURRENT` | `2` | Heavy jobs run at once; others wait |
+
 ## Stylistic Fingerprint Fields
 
 The fingerprint classifier produces 8 deterministic fields:

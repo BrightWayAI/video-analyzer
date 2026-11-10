@@ -36,6 +36,7 @@ dev = ["build", "twine"]
 
 [project.scripts]
 video-analyzer-mcp = "video_analyzer_mcp.server:main"
+video-analyzer-mcp-http = "video_analyzer_mcp.hosted:http_main"
 
 [build-system]
 requires = ["hatchling"]

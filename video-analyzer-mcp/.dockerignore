@@ -1,0 +1,4 @@
+.venv
+dist
+.mcpregistry_*
+**/__pycache__

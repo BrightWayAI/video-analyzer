@@ -9,17 +9,21 @@ and produce storyboard breakdowns.
 Requires: FFmpeg installed on the system, ANTHROPIC_API_KEY env var.
 """
 
+import functools
 import json
 import os
+import shutil
 import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+import anyio
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from video_analyzer_mcp import analyze_video as av
+from video_analyzer_mcp import hosted
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -71,7 +75,9 @@ class AnalyzeVideoInput(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("input_path cannot be empty")
-        if not av.is_url(v) and not os.path.isfile(v):
+        if hosted.is_hosted():
+            hosted.validate_remote_url(v)
+        elif not av.is_url(v) and not os.path.isfile(v):
             raise ValueError(f"File not found: {v}")
         return v
 
@@ -142,6 +148,11 @@ class FingerprintInput(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _run(fn, *args, **kwargs):
+    """Run blocking work in a worker thread so the event loop stays responsive."""
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
 
 def _resolve_video(input_path: str, temp_dir: str, cookies_file: Optional[str] = None):
     """Download URL or validate local file. Returns (video_path, title)."""
@@ -232,12 +243,17 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context) -> str:
     Requires: FFmpeg, ANTHROPIC_API_KEY env var.
     Processing time depends on video length (typically 1-5 minutes).
     """
+    hosted.check_hosted_inputs(params.input_path, params.cookies_file)
     _check_deps()
 
     await ctx.report_progress(0.05, "Starting video analysis pipeline...")
 
     try:
-        output_path = av.process_video(
+        if hosted.is_hosted():
+            return await _analyze_hosted(params)
+
+        output_path = await _run(
+            av.process_video,
             input_path=params.input_path,
             interval=params.interval,
             output_format=params.output_format.value,
@@ -266,6 +282,34 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context) -> str:
         }, indent=2)
 
 
+async def _analyze_hosted(params: AnalyzeVideoInput) -> str:
+    """Hosted variant: Markdown storyboard returned inline, nothing kept on disk."""
+    async with hosted.job_slot():
+        work_dir = tempfile.mkdtemp(prefix="va-")
+        try:
+            output_path = await _run(
+                av.process_video,
+                input_path=params.input_path,
+                interval=params.interval,
+                output_format="md",
+                verbose=False,
+                output_base=work_dir,
+                max_duration=hosted.max_duration(),
+            )
+            storyboard = Path(output_path).read_text(encoding="utf-8")
+            frames_dir = Path(output_path).parent.parent / "frames"
+            frame_count = len(list(frames_dir.glob("*.jpg"))) + len(list(frames_dir.glob("*.png")))
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return json.dumps({
+        "status": "success",
+        "output_format": "md",
+        "frames_extracted": frame_count,
+        "storyboard_markdown": storyboard,
+    }, indent=2)
+
+
 @mcp.tool(
     name="video_extract_frames",
     annotations={
@@ -286,24 +330,36 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context) -> str:
 
     Returns a list of extracted shots with frame paths and timestamps.
     """
+    hosted.check_hosted_inputs(params.input_path, params.cookies_file, params.output_dir)
     _check_deps()
 
     await ctx.report_progress(0.1, "Preparing to extract frames...")
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path, title = _resolve_video(params.input_path, temp_dir, params.cookies_file)
+        async with hosted.job_slot():
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
 
-            safe_title = av.sanitize_filename(title)
-            script_dir = Path(__file__).resolve().parent.parent.parent
-            frames_dir = params.output_dir or str(script_dir / "output" / safe_title / "frames")
-            os.makedirs(frames_dir, exist_ok=True)
+                if hosted.is_hosted():
+                    frames_dir = os.path.join(temp_dir, "frames")
+                else:
+                    safe_title = av.sanitize_filename(title)
+                    script_dir = Path(__file__).resolve().parent.parent.parent
+                    frames_dir = params.output_dir or str(script_dir / "output" / safe_title / "frames")
+                os.makedirs(frames_dir, exist_ok=True)
 
-            duration = av.get_video_duration(video_path)
-            width, height, orientation = av.get_video_dimensions(video_path)
+                duration = await _run(av.get_video_duration, video_path)
+                hosted.check_duration(duration)
+                width, height, orientation = await _run(av.get_video_dimensions, video_path)
 
-            await ctx.report_progress(0.3, "Detecting scenes and extracting frames...")
-            shots = _extract_shots(video_path, frames_dir, params.interval, duration)
+                await ctx.report_progress(0.3, "Detecting scenes and extracting frames...")
+                shots = await _run(_extract_shots, video_path, frames_dir, params.interval, duration)
+
+        shot_dicts = _shots_to_dicts(shots)
+        if hosted.is_hosted():
+            # Frames lived in a temp dir on the server; paths mean nothing to the caller.
+            for d in shot_dicts:
+                d.pop("frame_path", None)
 
         return json.dumps({
             "status": "success",
@@ -312,8 +368,8 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context) -> str:
             "dimensions": f"{width}x{height}",
             "orientation": orientation,
             "shots_extracted": len(shots),
-            "frames_directory": frames_dir,
-            "shots": _shots_to_dicts(shots),
+            **({} if hosted.is_hosted() else {"frames_directory": frames_dir}),
+            "shots": shot_dicts,
         }, indent=2)
 
     except Exception as e:
@@ -343,16 +399,21 @@ async def video_transcribe(params: TranscribeInput, ctx: Context) -> str:
 
     The 'base' model is fastest; 'large' is most accurate but slower.
     """
+    hosted.check_hosted_inputs(params.input_path, params.cookies_file)
+    if hosted.is_hosted() and params.model_size.value not in hosted.HOSTED_WHISPER_MODELS:
+        raise ValueError("The hosted server supports Whisper 'base' and 'small' only.")
     _check_deps()
 
     await ctx.report_progress(0.1, "Loading Whisper model...")
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path, title = _resolve_video(params.input_path, temp_dir, params.cookies_file)
+        async with hosted.job_slot():
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
+                hosted.check_duration(await _run(av.get_video_duration, video_path))
 
-            await ctx.report_progress(0.3, "Transcribing audio...")
-            segments = av.transcribe_audio(video_path, model_size=params.model_size.value, verbose=False)
+                await ctx.report_progress(0.3, "Transcribing audio...")
+                segments = await _run(av.transcribe_audio, video_path, model_size=params.model_size.value, verbose=False)
 
         full_text = " ".join(seg.text for seg in segments)
         word_count = len(full_text.split())
@@ -402,47 +463,51 @@ async def video_fingerprint(params: FingerprintInput, ctx: Context) -> str:
 
     Requires: FFmpeg, ANTHROPIC_API_KEY.
     """
+    hosted.check_hosted_inputs(params.input_path, params.cookies_file)
     _check_deps()
 
     await ctx.report_progress(0.05, "Starting fingerprint analysis...")
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path, title = _resolve_video(params.input_path, temp_dir, params.cookies_file)
+        async with hosted.job_slot():
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
 
-            duration = av.get_video_duration(video_path)
-            width, height, orientation = av.get_video_dimensions(video_path)
+                duration = await _run(av.get_video_duration, video_path)
+                hosted.check_duration(duration)
+                width, height, orientation = await _run(av.get_video_dimensions, video_path)
 
-            # Extract frames
-            await ctx.report_progress(0.15, "Extracting frames...")
-            frames_dir = os.path.join(temp_dir, "frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            shots = _extract_shots(video_path, frames_dir, params.interval, duration)
+                # Extract frames
+                await ctx.report_progress(0.15, "Extracting frames...")
+                frames_dir = os.path.join(temp_dir, "frames")
+                os.makedirs(frames_dir, exist_ok=True)
+                shots = await _run(_extract_shots, video_path, frames_dir, params.interval, duration)
 
-            # Transcribe
-            await ctx.report_progress(0.35, "Transcribing audio...")
-            transcript = av.transcribe_audio(video_path, verbose=False)
+                # Transcribe
+                await ctx.report_progress(0.35, "Transcribing audio...")
+                transcript = await _run(av.transcribe_audio, video_path, verbose=False)
 
-            # Analyze visuals
-            await ctx.report_progress(0.55, "Analyzing frames with Claude Vision...")
-            shots = av.analyze_all_frames(shots, orientation, verbose=False)
+                # Analyze visuals
+                await ctx.report_progress(0.55, "Analyzing frames with Claude Vision...")
+                shots = await _run(av.analyze_all_frames, shots, orientation, verbose=False)
 
-            # Align transcript
-            shots = av.align_transcript_to_shots(shots, transcript)
+                # Align transcript
+                shots = av.align_transcript_to_shots(shots, transcript)
 
-            # Content analysis for reading level
-            await ctx.report_progress(0.75, "Running content analysis...")
-            key_details, reading_level, story_structure = av.analyze_video_content(
-                transcript, shots, title, verbose=False
-            )
+                # Content analysis for reading level
+                await ctx.report_progress(0.75, "Running content analysis...")
+                key_details, reading_level, story_structure = await _run(
+                    av.analyze_video_content, transcript, shots, title, verbose=False
+                )
 
-            # Stylistic fingerprint
-            await ctx.report_progress(0.9, "Computing stylistic fingerprint...")
-            fingerprint = av.analyze_stylistic_fingerprint(
-                shots, transcript, duration,
-                orientation=orientation,
-                reading_level=reading_level,
-            )
+                # Stylistic fingerprint
+                await ctx.report_progress(0.9, "Computing stylistic fingerprint...")
+                fingerprint = await _run(
+                    av.analyze_stylistic_fingerprint,
+                    shots, transcript, duration,
+                    orientation=orientation,
+                    reading_level=reading_level,
+                )
 
         # Remove legacy v2 keys for clean output
         clean_fingerprint = {

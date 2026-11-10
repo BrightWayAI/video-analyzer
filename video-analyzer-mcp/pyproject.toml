@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.26,<2",
     "pydantic>=2.0.0",
     "openai-whisper>=20231117",
     "scenedetect[opencv]>=0.6.2",

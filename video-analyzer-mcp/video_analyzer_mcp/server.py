@@ -12,7 +12,6 @@ Requires: FFmpeg installed on the system, ANTHROPIC_API_KEY env var.
 import functools
 import json
 import os
-import shutil
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -218,12 +217,70 @@ def _check_deps():
         )
 
 
+
+
+class _Progress:
+    """Progress reporting that works from worker threads, plus a heartbeat.
+
+    Steps report through `callback` (safe to call from a worker thread). While a
+    step runs, `heartbeat()` re-sends the latest progress every few seconds so
+    long steps keep the connection active and the caller sees it's alive.
+    """
+
+    def __init__(self, ctx: Context, interval: float = 15.0):
+        self.ctx = ctx
+        self.interval = interval
+        self.frac = 0.0
+        self.msg = "Starting"
+
+    async def report(self, frac: float, msg: str):
+        self.frac, self.msg = frac, msg
+        try:
+            await self.ctx.report_progress(frac, 1.0, msg)
+        except Exception:  # a client that went away mustn't kill the job
+            pass
+
+    def callback(self, frac: float, msg: str):
+        try:
+            anyio.from_thread.run(self.report, frac, msg)
+        except Exception:
+            pass
+
+    async def _beat(self):
+        while True:
+            await anyio.sleep(self.interval)
+            try:
+                await self.ctx.report_progress(self.frac, 1.0, f"{self.msg} (still working)")
+            except Exception:
+                pass
+
+    async def run(self, fn, *args, **kwargs):
+        """Run blocking fn in a worker thread with the heartbeat going."""
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(self._beat)
+            try:
+                return await _run(fn, *args, **kwargs)
+            finally:
+                tg.cancel_scope.cancel()
+
+
+def _fail(e: Exception) -> None:
+    """Re-raise a pipeline error as a tool error with a helpful hint."""
+    raise RuntimeError(f"{e} — {_error_suggestion(e)}") from e
+
+
+def _frames_url_rewrite(markdown: str, base: Optional[str]) -> str:
+    """Point the storyboard's ../frames/ image links at the hosted copies."""
+    return markdown.replace("](../frames/", f"]({base}/frames/") if base else markdown
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool(
     name="video_analyze",
+    structured_output=False,
     annotations={
         "title": "Analyze Video (Full Pipeline)",
         "readOnlyHint": False,
@@ -232,27 +289,27 @@ def _check_deps():
         "openWorldHint": True,
     },
 )
-async def video_analyze(params: AnalyzeVideoInput, ctx: Context) -> str:
+async def video_analyze(params: AnalyzeVideoInput, ctx: Context):
     """Run the full video analysis pipeline: download, extract frames, transcribe
-    audio, analyze visuals with Claude, generate stylistic fingerprint, and
-    produce a storyboard breakdown document.
+    audio, analyze visuals with Claude, generate the stylistic fingerprint, and
+    produce a shot-by-shot storyboard.
 
-    Returns the path to the generated output file and a summary of the analysis
-    including metadata, stylistic fingerprint, and shot count.
+    On the hosted server the result is a summary (with the fingerprint and links
+    to the Word storyboard, frame images and a zip of all frames), the storyboard
+    as Markdown, and a contact-sheet image of the shots. Locally it writes the
+    storyboard to disk and returns its path.
 
-    Requires: FFmpeg, ANTHROPIC_API_KEY env var.
-    Processing time depends on video length (typically 1-5 minutes).
+    Processing time depends on video length (typically 1-3 minutes).
     """
     hosted.check_hosted_inputs(params.input_path, params.cookies_file)
+    if hosted.is_hosted():
+        return await hosted.cached_call("video_analyze", params, lambda: _analyze_hosted(params, ctx))
+
     _check_deps()
-
-    await ctx.report_progress(0.05, "Starting video analysis pipeline...")
-
+    progress = _Progress(ctx)
+    await progress.report(0.05, "Starting video analysis pipeline")
     try:
-        if hosted.is_hosted():
-            return await _analyze_hosted(params)
-
-        output_path = await _run(
+        output_path = await progress.run(
             av.process_video,
             input_path=params.input_path,
             interval=params.interval,
@@ -260,58 +317,83 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context) -> str:
             cookies_file=params.cookies_file,
             verbose=False,
         )
-
-        # Read back some metadata for the response
-        output_dir = Path(output_path).parent.parent
-        frames_dir = output_dir / "frames"
-        frame_count = len(list(frames_dir.glob("*.jpg"))) + len(list(frames_dir.glob("*.png")))
-
-        return json.dumps({
-            "status": "success",
-            "output_path": output_path,
-            "output_format": params.output_format.value,
-            "frames_extracted": frame_count,
-            "output_directory": str(output_dir),
-        }, indent=2)
-
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e),
-            "suggestion": _error_suggestion(e),
-        }, indent=2)
+        _fail(e)
 
-
-async def _analyze_hosted(params: AnalyzeVideoInput) -> str:
-    """Hosted variant: Markdown storyboard returned inline, nothing kept on disk."""
-    async with hosted.job_slot():
-        work_dir = tempfile.mkdtemp(prefix="va-")
-        try:
-            output_path = await _run(
-                av.process_video,
-                input_path=params.input_path,
-                interval=params.interval,
-                output_format="md",
-                verbose=False,
-                output_base=work_dir,
-                max_duration=hosted.max_duration(),
-            )
-            storyboard = Path(output_path).read_text(encoding="utf-8")
-            frames_dir = Path(output_path).parent.parent / "frames"
-            frame_count = len(list(frames_dir.glob("*.jpg"))) + len(list(frames_dir.glob("*.png")))
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
-
+    output_dir = Path(output_path).parent.parent
+    frames_dir = output_dir / "frames"
+    frame_count = len(list(frames_dir.glob("*.jpg"))) + len(list(frames_dir.glob("*.png")))
     return json.dumps({
         "status": "success",
-        "output_format": "md",
+        "output_path": output_path,
+        "output_format": params.output_format.value,
         "frames_extracted": frame_count,
-        "storyboard_markdown": storyboard,
+        "output_directory": str(output_dir),
     }, indent=2)
+
+
+async def _analyze_hosted(params: AnalyzeVideoInput, ctx: Context):
+    """Hosted pipeline: results inline, files behind expiring private links."""
+    from mcp.server.fastmcp import Image
+
+    _check_deps()
+    progress = _Progress(ctx)
+    async with hosted.job_slot(), hosted.job_log("video_analyze", params.input_path) as log:
+        await progress.report(0.02, "Downloading video")
+        bundle = hosted.new_bundle()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path, title = await progress.run(_resolve_video, params.input_path, temp_dir)
+                log.step("download")
+                result = await progress.run(
+                    av.analyze_video_file,
+                    video_path, title, str(bundle.path / "frames"),
+                    interval=params.interval,
+                    max_duration=hosted.max_duration(),
+                    max_frames=hosted.max_frames(),
+                    progress=progress.callback,
+                )
+                log.step("analysis", shots=len(result.shots), frames_analyzed=result.frames_analyzed)
+        except Exception as e:
+            bundle.discard()
+            _fail(e)
+
+        await progress.report(0.95, "Writing storyboard")
+        shots, meta, style = result.shots, result.metadata, result.visual_style
+        markdown = await _run(av.generate_markdown_output, shots, meta, str(bundle.path / "frames"), style)
+        await _run(av.generate_docx_output, shots, meta, str(bundle.path / "storyboard.docx"), style)
+        sheet = await _run(av.make_contact_sheet, shots, str(bundle.path / "contact_sheet.jpg"))
+        await _run(bundle.zip_dir, "frames", "frames.zip")
+        log.step("outputs")
+
+    base = bundle.url
+    summary = {
+        "status": "success",
+        "title": meta.title,
+        "duration_seconds": round(meta.duration, 1),
+        "orientation": meta.orientation,
+        "shots": len(shots),
+        "frames_analyzed": result.frames_analyzed,
+        "reading_level": meta.reading_level,
+        "story_structure": meta.story_structure,
+        "fingerprint": {k: v for k, v in style.items() if not k.startswith("legacy_")},
+    }
+    if base:
+        summary["files"] = {
+            "storyboard_docx": f"{base}/storyboard.docx",
+            "contact_sheet": f"{base}/contact_sheet.jpg",
+            "frames_zip": f"{base}/frames.zip",
+            "links_expire_after_hours": hosted.file_ttl_hours(),
+        }
+    content = [json.dumps(summary, indent=2), _frames_url_rewrite(markdown, base)]
+    if sheet:
+        content.append(Image(data=Path(sheet).read_bytes(), format="jpeg"))
+    return content
 
 
 @mcp.tool(
     name="video_extract_frames",
+    structured_output=False,
     annotations={
         "title": "Extract Video Frames",
         "readOnlyHint": False,
@@ -320,64 +402,101 @@ async def _analyze_hosted(params: AnalyzeVideoInput) -> str:
         "openWorldHint": True,
     },
 )
-async def video_extract_frames(params: ExtractFramesInput, ctx: Context) -> str:
+async def video_extract_frames(params: ExtractFramesInput, ctx: Context):
     """Extract representative frames from a video using scene detection or
     fixed intervals.
 
-    Uses PySceneDetect with ContentDetector and AdaptiveDetector to find
-    scene boundaries, then extracts the middle frame of each scene.
-    Falls back to 3-second intervals if no scenes are detected.
+    Uses PySceneDetect to find scene boundaries, then extracts the middle frame
+    of each scene. Falls back to 3-second intervals if no scenes are detected.
 
-    Returns a list of extracted shots with frame paths and timestamps.
+    Returns the shots with timestamps. On the hosted server each shot has a
+    frame_url, and the result includes a contact-sheet image and a zip link.
     """
+
     hosted.check_hosted_inputs(params.input_path, params.cookies_file, params.output_dir)
+    if hosted.is_hosted():
+        return await hosted.cached_call("video_extract_frames", params, lambda: _extract_hosted(params, ctx))
+
     _check_deps()
-
-    await ctx.report_progress(0.1, "Preparing to extract frames...")
-
+    progress = _Progress(ctx)
+    await progress.report(0.1, "Preparing to extract frames")
     try:
-        async with hosted.job_slot():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path, title = await progress.run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
+            safe_title = av.sanitize_filename(title)
+            script_dir = Path(__file__).resolve().parent.parent.parent
+            frames_dir = params.output_dir or str(script_dir / "output" / safe_title / "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            duration = await _run(av.get_video_duration, video_path)
+            width, height, orientation = await _run(av.get_video_dimensions, video_path)
+            await progress.report(0.3, "Detecting scenes and extracting frames")
+            shots = await progress.run(_extract_shots, video_path, frames_dir, params.interval, duration)
+    except Exception as e:
+        _fail(e)
+
+    return json.dumps({
+        "status": "success",
+        "title": title,
+        "duration_seconds": round(duration, 1),
+        "dimensions": f"{width}x{height}",
+        "orientation": orientation,
+        "shots_extracted": len(shots),
+        "frames_directory": frames_dir,
+        "shots": _shots_to_dicts(shots),
+    }, indent=2)
+
+
+async def _extract_hosted(params: ExtractFramesInput, ctx: Context):
+    from mcp.server.fastmcp import Image
+
+    _check_deps()
+    progress = _Progress(ctx)
+    async with hosted.job_slot(), hosted.job_log("video_extract_frames", params.input_path) as log:
+        await progress.report(0.05, "Downloading video")
+        bundle = hosted.new_bundle()
+        frames_dir = bundle.path / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
-
-                if hosted.is_hosted():
-                    frames_dir = os.path.join(temp_dir, "frames")
-                else:
-                    safe_title = av.sanitize_filename(title)
-                    script_dir = Path(__file__).resolve().parent.parent.parent
-                    frames_dir = params.output_dir or str(script_dir / "output" / safe_title / "frames")
-                os.makedirs(frames_dir, exist_ok=True)
-
+                video_path, title = await progress.run(_resolve_video, params.input_path, temp_dir)
+                log.step("download")
                 duration = await _run(av.get_video_duration, video_path)
                 hosted.check_duration(duration)
                 width, height, orientation = await _run(av.get_video_dimensions, video_path)
+                await progress.report(0.3, "Detecting scenes and extracting frames")
+                shots = await progress.run(_extract_shots, video_path, str(frames_dir), params.interval, duration)
+                log.step("frames", shots=len(shots))
+        except Exception as e:
+            bundle.discard()
+            _fail(e)
+        sheet = await _run(av.make_contact_sheet, shots, str(bundle.path / "contact_sheet.jpg"))
+        await _run(bundle.zip_dir, "frames", "frames.zip")
 
-                await ctx.report_progress(0.3, "Detecting scenes and extracting frames...")
-                shots = await _run(_extract_shots, video_path, frames_dir, params.interval, duration)
-
-        shot_dicts = _shots_to_dicts(shots)
-        if hosted.is_hosted():
-            # Frames lived in a temp dir on the server; paths mean nothing to the caller.
-            for d in shot_dicts:
-                d.pop("frame_path", None)
-
-        return json.dumps({
-            "status": "success",
-            "title": title,
-            "duration_seconds": round(duration, 1),
-            "dimensions": f"{width}x{height}",
-            "orientation": orientation,
-            "shots_extracted": len(shots),
-            **({} if hosted.is_hosted() else {"frames_directory": frames_dir}),
-            "shots": shot_dicts,
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e),
-            "suggestion": _error_suggestion(e),
-        }, indent=2)
+    base = bundle.url
+    shot_dicts = _shots_to_dicts(shots)
+    for d in shot_dicts:
+        name = Path(d.pop("frame_path") or "").name
+        if base and name:
+            d["frame_url"] = f"{base}/frames/{name}"
+    summary = {
+        "status": "success",
+        "title": title,
+        "duration_seconds": round(duration, 1),
+        "dimensions": f"{width}x{height}",
+        "orientation": orientation,
+        "shots_extracted": len(shots),
+        "shots": shot_dicts,
+    }
+    if base:
+        summary["files"] = {
+            "contact_sheet": f"{base}/contact_sheet.jpg",
+            "frames_zip": f"{base}/frames.zip",
+            "links_expire_after_hours": hosted.file_ttl_hours(),
+        }
+    content = [json.dumps(summary, indent=2)]
+    if sheet:
+        content.append(Image(data=Path(sheet).read_bytes(), format="jpeg"))
+    return content
 
 
 @mcp.tool(
@@ -387,53 +506,56 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context) -> str:
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": False,
+        "openWorldHint": True,
     },
 )
 async def video_transcribe(params: TranscribeInput, ctx: Context) -> str:
-    """Transcribe the audio track of a video using OpenAI Whisper.
+    """Transcribe the audio track of a video using OpenAI Whisper (runs locally,
+    no OpenAI key needed).
 
     Returns timestamped transcript segments with inferred speaker labels
-    (NARRATOR, TEACHER, CHILD, SPEAKER). Supports multiple Whisper model
-    sizes trading off speed vs accuracy.
-
-    The 'base' model is fastest; 'large' is most accurate but slower.
+    (NARRATOR, TEACHER, CHILD, SPEAKER). 'base' is fastest; 'large' is most
+    accurate (the hosted server offers 'base' and 'small').
     """
     hosted.check_hosted_inputs(params.input_path, params.cookies_file)
     if hosted.is_hosted() and params.model_size.value not in hosted.HOSTED_WHISPER_MODELS:
         raise ValueError("The hosted server supports Whisper 'base' and 'small' only.")
+    if hosted.is_hosted():
+        return await hosted.cached_call("video_transcribe", params, lambda: _transcribe(params, ctx))
+    return await _transcribe(params, ctx)
+
+
+async def _transcribe(params: TranscribeInput, ctx: Context) -> str:
     _check_deps()
-
-    await ctx.report_progress(0.1, "Loading Whisper model...")
-
-    try:
-        async with hosted.job_slot():
+    progress = _Progress(ctx)
+    async with hosted.job_slot(), hosted.job_log("video_transcribe", params.input_path) as log:
+        await progress.report(0.1, "Downloading video")
+        try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
+                video_path, title = await progress.run(
+                    _resolve_video, params.input_path, temp_dir,
+                    None if hosted.is_hosted() else params.cookies_file,
+                )
+                log.step("download")
                 hosted.check_duration(await _run(av.get_video_duration, video_path))
+                await progress.report(0.3, "Transcribing audio")
+                segments = await progress.run(
+                    av.transcribe_audio, video_path, model_size=params.model_size.value, verbose=False
+                )
+                log.step("transcribe", segments=len(segments))
+        except Exception as e:
+            _fail(e)
 
-                await ctx.report_progress(0.3, "Transcribing audio...")
-                segments = await _run(av.transcribe_audio, video_path, model_size=params.model_size.value, verbose=False)
-
-        full_text = " ".join(seg.text for seg in segments)
-        word_count = len(full_text.split())
-
-        return json.dumps({
-            "status": "success",
-            "title": title,
-            "model_used": params.model_size.value,
-            "segments": len(segments),
-            "word_count": word_count,
-            "transcript": _segments_to_dicts(segments),
-            "full_text": full_text,
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e),
-            "suggestion": _error_suggestion(e),
-        }, indent=2)
+    full_text = " ".join(seg.text for seg in segments)
+    return json.dumps({
+        "status": "success",
+        "title": title,
+        "model_used": params.model_size.value,
+        "segments": len(segments),
+        "word_count": len(full_text.split()),
+        "transcript": _segments_to_dicts(segments),
+        "full_text": full_text,
+    }, indent=2)
 
 
 @mcp.tool(
@@ -460,90 +582,50 @@ async def video_fingerprint(params: FingerprintInput, ctx: Context) -> str:
     6. Visual Density (Minimal to High)
     7. Camera/Editing Language (e.g., Cinematic, Social Vertical Punch)
     8. Tonal Positioning (e.g., Institutional, Gen Z Social, Child-Friendly)
-
-    Requires: FFmpeg, ANTHROPIC_API_KEY.
     """
     hosted.check_hosted_inputs(params.input_path, params.cookies_file)
+    if hosted.is_hosted():
+        return await hosted.cached_call("video_fingerprint", params, lambda: _fingerprint(params, ctx))
+    return await _fingerprint(params, ctx)
+
+
+async def _fingerprint(params: FingerprintInput, ctx: Context) -> str:
     _check_deps()
-
-    await ctx.report_progress(0.05, "Starting fingerprint analysis...")
-
-    try:
-        async with hosted.job_slot():
+    progress = _Progress(ctx)
+    async with hosted.job_slot(), hosted.job_log("video_fingerprint", params.input_path) as log:
+        await progress.report(0.05, "Downloading video")
+        try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                video_path, title = await _run(_resolve_video, params.input_path, temp_dir, params.cookies_file)
-
-                duration = await _run(av.get_video_duration, video_path)
-                hosted.check_duration(duration)
-                width, height, orientation = await _run(av.get_video_dimensions, video_path)
-
-                # Extract frames
-                await ctx.report_progress(0.15, "Extracting frames...")
-                frames_dir = os.path.join(temp_dir, "frames")
-                os.makedirs(frames_dir, exist_ok=True)
-                shots = await _run(_extract_shots, video_path, frames_dir, params.interval, duration)
-
-                # Transcribe
-                await ctx.report_progress(0.35, "Transcribing audio...")
-                transcript = await _run(av.transcribe_audio, video_path, verbose=False)
-
-                # Analyze visuals
-                await ctx.report_progress(0.55, "Analyzing frames with Claude Vision...")
-                shots = await _run(av.analyze_all_frames, shots, orientation, verbose=False)
-
-                # Align transcript
-                shots = av.align_transcript_to_shots(shots, transcript)
-
-                # Content analysis for reading level
-                await ctx.report_progress(0.75, "Running content analysis...")
-                key_details, reading_level, story_structure = await _run(
-                    av.analyze_video_content, transcript, shots, title, verbose=False
+                video_path, title = await progress.run(
+                    _resolve_video, params.input_path, temp_dir,
+                    None if hosted.is_hosted() else params.cookies_file,
                 )
-
-                # Stylistic fingerprint
-                await ctx.report_progress(0.9, "Computing stylistic fingerprint...")
-                fingerprint = await _run(
-                    av.analyze_stylistic_fingerprint,
-                    shots, transcript, duration,
-                    orientation=orientation,
-                    reading_level=reading_level,
+                log.step("download")
+                result = await progress.run(
+                    av.analyze_video_file,
+                    video_path, title, os.path.join(temp_dir, "frames"),
+                    interval=params.interval,
+                    max_duration=hosted.max_duration() if hosted.is_hosted() else None,
+                    max_frames=hosted.max_frames() if hosted.is_hosted() else None,
+                    progress=progress.callback,
                 )
+                log.step("analysis", shots=len(result.shots), frames_analyzed=result.frames_analyzed)
+        except Exception as e:
+            _fail(e)
 
-        # Remove legacy v2 keys for clean output
-        clean_fingerprint = {
-            k: v for k, v in fingerprint.items()
-            if not k.startswith("legacy_")
-        }
-
-        return json.dumps({
-            "status": "success",
-            "title": title,
-            "duration_seconds": round(duration, 1),
-            "orientation": orientation,
-            "shots_analyzed": len(shots),
-            "reading_level": reading_level,
-            "story_structure": story_structure,
-            "fingerprint": clean_fingerprint,
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e),
-            "suggestion": _error_suggestion(e),
-        }, indent=2)
+    meta = result.metadata
+    return json.dumps({
+        "status": "success",
+        "title": title,
+        "duration_seconds": round(meta.duration, 1),
+        "orientation": meta.orientation,
+        "shots_analyzed": result.frames_analyzed,
+        "reading_level": meta.reading_level,
+        "story_structure": meta.story_structure,
+        "fingerprint": {k: v for k, v in result.visual_style.items() if not k.startswith("legacy_")},
+    }, indent=2)
 
 
-@mcp.tool(
-    name="video_check_deps",
-    annotations={
-        "title": "Check Dependencies",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
 async def video_check_deps() -> str:
     """Check if all required dependencies (FFmpeg, Whisper, etc.) are installed.
 
@@ -566,17 +648,30 @@ async def video_check_deps() -> str:
         "Pillow": "pip install Pillow",
         "yt-dlp (for URL support)": "pip install yt-dlp",
     }
-
-    details = []
-    for dep in missing:
-        hint = install_hints.get(dep, f"pip install {dep}")
-        details.append({"dependency": dep, "install": hint})
-
+    details = [
+        {"dependency": dep, "install": install_hints.get(dep, f"pip install {dep}")}
+        for dep in missing
+    ]
     return json.dumps({
         "status": "missing_dependencies",
         "missing": details,
         "message": f"{len(missing)} dependency(ies) missing. Install them to unlock full functionality.",
     }, indent=2)
+
+
+# Local installs only: on the hosted server this would just use up a buyer's
+# monthly calls, and the operator keeps the dependencies in order.
+if not hosted.is_hosted():
+    mcp.tool(
+        name="video_check_deps",
+        annotations={
+            "title": "Check Dependencies",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )(video_check_deps)
 
 
 # ---------------------------------------------------------------------------
@@ -590,13 +685,17 @@ def _error_suggestion(e: Exception) -> str:
         return "FFmpeg is not installed. Install it: brew install ffmpeg (macOS) or apt-get install ffmpeg (Linux)"
     if "anthropic_api_key" in msg or "api_key" in msg:
         return "Set the ANTHROPIC_API_KEY environment variable before running the server."
+    if "sign in to confirm" in msg or "not a bot" in msg:
+        return "YouTube blocked the download from this server. Try a direct link to the video file, or another host (Vimeo, Loom, Drive)."
+    if "download failed" in msg:
+        return "Check that the URL is a public video. Private, age-restricted and members-only videos can't be downloaded."
+    if "limit is" in msg:
+        return "Trim the video or send a shorter clip."
     if "whisper" in msg:
         return "OpenAI Whisper is not installed. Run: pip install openai-whisper"
     if "no such file" in msg or "not found" in msg:
         return "The specified file was not found. Check the path and try again."
-    if "yt-dlp" in msg or "download" in msg:
-        return "yt-dlp may not be installed, or the URL is invalid. Run: pip install yt-dlp"
-    return "Check the error message above and ensure all dependencies are installed."
+    return "Check the error message above and try again."
 
 
 # ---------------------------------------------------------------------------

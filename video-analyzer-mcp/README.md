@@ -90,6 +90,16 @@ docker run -p 8000:8000 \
 | `PORT` | `8000` | Listen port |
 | `VIDEO_ANALYZER_MAX_SECONDS` | `600` | Longest video accepted |
 | `VIDEO_ANALYZER_MAX_CONCURRENT` | `2` | Heavy jobs run at once; others wait |
+| `PUBLIC_BASE_URL` | Railway domain | Base for the expiring file links in results (e.g. `https://videomcp.example.com`) |
+| `VIDEO_ANALYZER_MODEL` | `claude-sonnet-5-5` | Claude model for frame and content analysis |
+| `VIDEO_ANALYZER_MAX_FRAMES` | `60` | Most frames sent to Claude per video (an even sample) |
+| `VIDEO_ANALYZER_FRAME_WORKERS` | `6` | Frames analyzed in parallel |
+| `VIDEO_ANALYZER_FILE_TTL_HOURS` | `72` | How long storyboard, frame and zip links work |
+| `VIDEO_ANALYZER_CACHE_HOURS` | `24` | A repeated identical call returns the cached result |
+| `YTDLP_PROXY` | | Proxy for video downloads (helps when YouTube blocks the server) |
+| `SENTRY_DSN` | | Send errors to Sentry |
+
+Hosted results: `video_analyze` returns a JSON summary (with the fingerprint and file links), the storyboard as Markdown with working image links, and a contact-sheet image. `video_extract_frames` returns shots with `frame_url`s and a contact sheet. `/healthz` answers `ok` for health checks.
 
 ## Stylistic Fingerprint Fields
 

@@ -17,6 +17,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -46,6 +48,46 @@ except ImportError:
 
 # docx imports are done lazily in generate_docx_output to avoid import issues
 Document = None
+
+
+# =============================================================================
+# Settings (read at call time so the hosted server and tests can override them)
+# =============================================================================
+
+DEFAULT_MODEL = "claude-sonnet-5-5"
+# Models that accept the server-side refusal fallback ("default" routing).
+_FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5",
+                    "claude-fable-5-1", "claude-fable-5-2"}
+
+
+def claude_model() -> str:
+    """Model for frame and content analysis (VIDEO_ANALYZER_MODEL)."""
+    return os.environ.get("VIDEO_ANALYZER_MODEL", DEFAULT_MODEL)
+
+
+def _frame_workers() -> int:
+    return max(1, int(os.environ.get("VIDEO_ANALYZER_FRAME_WORKERS", "6")))
+
+
+def _claude_text(client, content, max_tokens: int) -> str:
+    """One Claude call at low effort; returns the text, or "" on a refusal."""
+    model = claude_model()
+    kwargs = dict(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": content}],
+    )
+    if "-5" in model:
+        kwargs["output_config"] = {"effort": "low"}
+    if model in _FALLBACK_MODELS:
+        response = client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs
+        )
+    else:
+        response = client.messages.create(**kwargs)
+    if response.stop_reason == "refusal":
+        return ""
+    return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
 # =============================================================================
@@ -241,6 +283,13 @@ def sanitize_filename(name: str) -> str:
 # Video Download (for URLs)
 # =============================================================================
 
+def _ytdlp_error(stderr: str) -> str:
+    """The useful part of a yt-dlp failure: its last ERROR line."""
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    errors = [l for l in lines if l.startswith("ERROR")]
+    return (errors or lines or ["yt-dlp exited with an error"])[-1][:500]
+
+
 def download_video(url: str, output_dir: str, cookies_file: Optional[str] = None, verbose: bool = False) -> tuple[str, str]:
     """
     Download video from URL using yt-dlp.
@@ -251,8 +300,11 @@ def download_video(url: str, output_dir: str, cookies_file: Optional[str] = None
     if verbose:
         print(f"Downloading video from: {url}")
 
-    # Build base command with optional cookies
-    base_cmd = ["yt-dlp"]
+    # Build base command with optional cookies / proxy
+    base_cmd = ["yt-dlp", "--no-warnings", "--no-update"]
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        base_cmd.extend(["--proxy", proxy])
     if cookies_file and os.path.exists(cookies_file):
         base_cmd.extend(["--cookies", cookies_file])
         if verbose:
@@ -260,27 +312,31 @@ def download_video(url: str, output_dir: str, cookies_file: Optional[str] = None
 
     # First get the title
     title_result = subprocess.run(
-        base_cmd + ["--get-title", url],
+        base_cmd + ["--get-title", "--no-playlist", url],
         capture_output=True,
         text=True,
-        check=True
     )
-    title = title_result.stdout.strip()
+    if title_result.returncode != 0:
+        raise RuntimeError(f"Download failed: {_ytdlp_error(title_result.stderr)}")
+    title = title_result.stdout.strip().splitlines()[0] if title_result.stdout.strip() else "video"
 
     # Download the video with a safe filename to avoid FFmpeg issues with special chars
     safe_filename = "video_download.mp4"
     output_path = os.path.join(output_dir, safe_filename)
-    subprocess.run(
+    # 720p is plenty for frame analysis and keeps downloads fast
+    result = subprocess.run(
         base_cmd + [
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-f", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/b",
             "-o", output_path,
             "--no-playlist",
             "--merge-output-format", "mp4",
             url
         ],
-        check=True,
-        capture_output=not verbose
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"Download failed: {_ytdlp_error(result.stderr)}")
 
     if os.path.exists(output_path):
         return output_path, title
@@ -506,6 +562,18 @@ def create_shots_from_interval(
 # Audio Transcription
 # =============================================================================
 
+_WHISPER_MODELS: dict = {}
+_WHISPER_LOCK = threading.Lock()
+
+
+def _whisper_model(model_size: str):
+    """Load each Whisper model once per process instead of on every call."""
+    with _WHISPER_LOCK:
+        if model_size not in _WHISPER_MODELS:
+            _WHISPER_MODELS[model_size] = whisper.load_model(model_size)
+        return _WHISPER_MODELS[model_size]
+
+
 def transcribe_audio(
     video_path: str,
     model_size: str = "base",
@@ -523,15 +591,10 @@ def transcribe_audio(
     if verbose:
         print(f"Transcribing audio using Whisper ({model_size} model)...")
 
-    # Load model
-    model = whisper.load_model(model_size)
-
-    # Transcribe with word-level timestamps
-    result = model.transcribe(
-        video_path,
-        word_timestamps=True,
-        verbose=verbose
-    )
+    model = _whisper_model(model_size)
+    # Whisper models aren't safe to share across threads mid-transcription
+    with _WHISPER_LOCK:
+        result = model.transcribe(video_path, fp16=False, verbose=verbose)
 
     # Convert to TranscriptSegment objects
     segments = []
@@ -657,39 +720,38 @@ Example outputs:
 
 Provide ONLY the image prompt, no preamble or explanation."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=150,
-        messages=[
+    return _claude_text(
+        client,
+        [
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_data,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ],
-            }
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": image_data},
+            },
+            {"type": "text", "text": prompt},
         ],
+        max_tokens=2048,
     )
 
-    return response.content[0].text.strip()
+
+def sample_shots(shots: list[Shot], max_frames: Optional[int]) -> list[Shot]:
+    """Evenly spaced subset of at most max_frames shots (all of them if None)."""
+    if not max_frames or len(shots) <= max_frames:
+        return list(shots)
+    step = len(shots) / max_frames
+    return [shots[int(i * step)] for i in range(max_frames)]
 
 
 def analyze_all_frames(
     shots: list[Shot],
     orientation: str = "horizontal",
-    verbose: bool = False
+    verbose: bool = False,
+    max_frames: Optional[int] = None,
 ) -> list[Shot]:
-    """Analyze all shot frames using Claude Vision API."""
+    """Analyze shot frames with Claude Vision, several at a time.
+
+    With max_frames, only an evenly spaced sample is analyzed; the other shots
+    keep an empty description (the fingerprint only counts described shots).
+    """
     if anthropic is None:
         raise ImportError("anthropic package is required for visual analysis")
 
@@ -702,16 +764,55 @@ def analyze_all_frames(
     if verbose:
         print(f"Analyzing {len(shots)} frames with Claude Vision...")
 
-    for shot in shots:
-        if shot.frame_path and os.path.exists(shot.frame_path):
-            shot.visual_description = analyze_frame_with_claude(
-                shot.frame_path,
-                client,
-                orientation,
-                verbose
-            )
+    todo = [
+        s for s in sample_shots(shots, max_frames)
+        if s.frame_path and os.path.exists(s.frame_path)
+    ]
+
+    def one(shot):
+        try:
+            return analyze_frame_with_claude(shot.frame_path, client, orientation, verbose), None
+        except Exception as e:  # one bad frame shouldn't sink the whole video
+            return "", e
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=_frame_workers()) as pool:
+        for shot, (desc, err) in zip(todo, pool.map(one, todo)):
+            shot.visual_description = desc
+            if err is not None:
+                errors.append(err)
+    if todo and len(errors) == len(todo):
+        raise errors[0]
 
     return shots
+
+
+def make_contact_sheet(shots: list[Shot], out_path: str, columns: int = 4,
+                       thumb_width: int = 320, max_shots: int = 48) -> Optional[str]:
+    """Write a JPEG grid of shot thumbnails labelled with shot number and time."""
+    if Image is None:
+        return None
+    from PIL import ImageDraw
+
+    picked = [s for s in sample_shots(shots, max_shots) if s.frame_path and os.path.exists(s.frame_path)]
+    if not picked:
+        return None
+    thumbs = []
+    for s in picked:
+        im = Image.open(s.frame_path).convert("RGB")
+        im.thumbnail((thumb_width, thumb_width * 2))
+        thumbs.append((s, im))
+    cell_h = max(im.height for _, im in thumbs) + 22
+    rows = (len(thumbs) + columns - 1) // columns
+    sheet = Image.new("RGB", (columns * (thumb_width + 8) + 8, rows * (cell_h + 8) + 8), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, (s, im) in enumerate(thumbs):
+        x = 8 + (i % columns) * (thumb_width + 8)
+        y = 8 + (i // columns) * (cell_h + 8)
+        sheet.paste(im, (x, y))
+        draw.text((x + 2, y + im.height + 4), f"#{s.number}  {s.timestamp_str}", fill="black")
+    sheet.save(out_path, "JPEG", quality=80)
+    return out_path
 
 
 def analyze_video_content(
@@ -764,13 +865,7 @@ STORY STRUCTURE: [Narrative format like "Problem-Solution", "Sequential Tutorial
 
 Respond with ONLY these three sections, nothing else."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    response_text = response.content[0].text.strip()
+    response_text = _claude_text(client, prompt, max_tokens=4096)
 
     # Parse the response
     key_details = ""
@@ -1885,6 +1980,161 @@ def generate_docx_output(
 # Main Processing Pipeline
 # =============================================================================
 
+@dataclass
+class PipelineResult:
+    shots: list
+    metadata: "VideoMetadata"
+    visual_style: dict
+    transcript: list
+    frames_analyzed: int
+
+
+def analyze_video_file(
+    video_path: str,
+    title: str,
+    frames_dir: str,
+    interval: Optional[float] = None,
+    max_duration: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    verbose: bool = False,
+    progress=None,
+) -> "PipelineResult":
+    """Run frames -> transcript -> Claude analysis -> fingerprint on a local file.
+
+    progress, if given, is called as progress(fraction, message) between steps.
+    """
+    def _progress(frac, msg):
+        if progress:
+            progress(frac, msg)
+
+    os.makedirs(frames_dir, exist_ok=True)
+    # Get video duration and dimensions
+    duration = get_video_duration(video_path)
+    if max_duration is not None and duration > max_duration:
+        raise ValueError(
+            f"Video is {duration:.0f}s long; the limit is {max_duration:.0f}s."
+        )
+    width, height, orientation = get_video_dimensions(video_path)
+    if verbose:
+        print(f"Video duration: {duration:.1f} seconds")
+        print(f"Video dimensions: {width}x{height} ({orientation})")
+
+    _progress(0.15, "Detecting scenes and extracting frames")
+    # Step 2: Extract frames / detect scenes
+    if verbose:
+        print("=" * 50)
+        print("Step 2: Frame extraction / scene detection")
+        print("=" * 50)
+
+    if interval:
+        # Use fixed interval extraction
+        frames = extract_frames_at_interval(
+            video_path, frames_dir, interval, verbose
+        )
+        shots = create_shots_from_interval(frames, duration, interval)
+    else:
+        # Use scene detection
+        scenes = detect_scenes(video_path, verbose)
+
+        # Fallback to interval if no scenes detected
+        if not scenes:
+            if verbose:
+                print("No scenes detected, falling back to 3-second intervals")
+            frames = extract_frames_at_interval(
+                video_path, frames_dir, 3.0, verbose
+            )
+            shots = create_shots_from_interval(frames, duration, 3.0)
+        else:
+            shots = create_shots_from_scenes(
+                scenes, video_path, frames_dir, verbose
+            )
+
+    if verbose:
+        print(f"Created {len(shots)} shots")
+
+    _progress(0.35, "Transcribing audio")
+    # Step 3: Transcribe audio
+    if verbose:
+        print("=" * 50)
+        print("Step 3: Audio transcription")
+        print("=" * 50)
+
+    transcript = transcribe_audio(video_path, verbose=verbose)
+
+    _progress(0.5, "Analyzing frames with Claude")
+    # Step 4: Analyze visuals with Claude
+    if verbose:
+        print("=" * 50)
+        print("Step 4: Visual analysis with Claude")
+        print("=" * 50)
+
+    shots = analyze_all_frames(shots, orientation, verbose, max_frames=max_frames)
+
+    # Step 5: Align transcript to shots
+    if verbose:
+        print("=" * 50)
+        print("Step 5: Aligning transcript to shots")
+        print("=" * 50)
+
+    shots = align_transcript_to_shots(shots, transcript)
+
+    _progress(0.8, "Analyzing content")
+    # Step 5b: Analyze content for metadata (before fingerprint, since
+    #          fingerprint v2 uses reading_level for tonal positioning)
+    if verbose:
+        print("=" * 50)
+        print("Step 5b: Content analysis for metadata")
+        print("=" * 50)
+
+    key_details, reading_level, story_structure = analyze_video_content(
+        transcript, shots, title, verbose
+    )
+
+    _progress(0.9, "Computing stylistic fingerprint")
+    # Step 6: Stylistic fingerprint (v3)
+    if verbose:
+        print("=" * 50)
+        print("Step 6: Stylistic Fingerprint v3 (production-grade)")
+        print("=" * 50)
+
+    visual_style = analyze_stylistic_fingerprint(
+        shots, transcript, duration,
+        orientation=orientation,
+        reading_level=reading_level,
+    )
+
+    if verbose:
+        print(f"  Rendering Class: {visual_style['rendering_class']}")
+        print(f"  World Type: {visual_style['world_type']}")
+        print(f"  Character Strategy: {visual_style['character_strategy']}")
+        print(f"  Narrative Structure: {visual_style['narrative_structure']}")
+        print(f"  Visual Abstraction: {visual_style['visual_abstraction_index']}")
+        print(f"  Visual Density: {visual_style['visual_density']}")
+        print(f"  Camera/Editing: {visual_style['camera_editing']}")
+        print(f"  Tonal Positioning: {visual_style['tonal_positioning']}")
+
+    # Calculate word count from transcript
+    full_transcript = " ".join([seg.text for seg in transcript])
+    word_count = len(full_transcript.split())
+
+    # Create metadata object
+    metadata = VideoMetadata(
+        title=title,
+        duration=duration,
+        width=width,
+        height=height,
+        orientation=orientation,
+        word_count=word_count,
+        image_count=len(shots),
+        key_details=key_details,
+        reading_level=reading_level,
+        story_structure=story_structure
+    )
+
+    frames_analyzed = sum(1 for sh in shots if sh.visual_description)
+    return PipelineResult(shots, metadata, visual_style, transcript, frames_analyzed)
+
+
 def process_video(
     input_path: str,
     interval: Optional[float] = None,
@@ -1938,123 +2188,11 @@ def process_video(
         if verbose:
             print(f"Output folder: {video_output_dir}")
 
-        # Get video duration and dimensions
-        duration = get_video_duration(video_path)
-        if max_duration is not None and duration > max_duration:
-            raise ValueError(
-                f"Video is {duration:.0f}s long; the limit is {max_duration:.0f}s."
-            )
-        width, height, orientation = get_video_dimensions(video_path)
-        if verbose:
-            print(f"Video duration: {duration:.1f} seconds")
-            print(f"Video dimensions: {width}x{height} ({orientation})")
-
-        # Step 2: Extract frames / detect scenes
-        if verbose:
-            print("=" * 50)
-            print("Step 2: Frame extraction / scene detection")
-            print("=" * 50)
-
-        if interval:
-            # Use fixed interval extraction
-            frames = extract_frames_at_interval(
-                video_path, str(frames_dir), interval, verbose
-            )
-            shots = create_shots_from_interval(frames, duration, interval)
-        else:
-            # Use scene detection
-            scenes = detect_scenes(video_path, verbose)
-
-            # Fallback to interval if no scenes detected
-            if not scenes:
-                if verbose:
-                    print("No scenes detected, falling back to 3-second intervals")
-                frames = extract_frames_at_interval(
-                    video_path, str(frames_dir), 3.0, verbose
-                )
-                shots = create_shots_from_interval(frames, duration, 3.0)
-            else:
-                shots = create_shots_from_scenes(
-                    scenes, video_path, str(frames_dir), verbose
-                )
-
-        if verbose:
-            print(f"Created {len(shots)} shots")
-
-        # Step 3: Transcribe audio
-        if verbose:
-            print("=" * 50)
-            print("Step 3: Audio transcription")
-            print("=" * 50)
-
-        transcript = transcribe_audio(video_path, verbose=verbose)
-
-        # Step 4: Analyze visuals with Claude
-        if verbose:
-            print("=" * 50)
-            print("Step 4: Visual analysis with Claude")
-            print("=" * 50)
-
-        shots = analyze_all_frames(shots, orientation, verbose)
-
-        # Step 5: Align transcript to shots
-        if verbose:
-            print("=" * 50)
-            print("Step 5: Aligning transcript to shots")
-            print("=" * 50)
-
-        shots = align_transcript_to_shots(shots, transcript)
-
-        # Step 5b: Analyze content for metadata (before fingerprint, since
-        #          fingerprint v2 uses reading_level for tonal positioning)
-        if verbose:
-            print("=" * 50)
-            print("Step 5b: Content analysis for metadata")
-            print("=" * 50)
-
-        key_details, reading_level, story_structure = analyze_video_content(
-            transcript, shots, title, verbose
+        result = analyze_video_file(
+            video_path, title, str(frames_dir),
+            interval=interval, max_duration=max_duration, verbose=verbose,
         )
-
-        # Step 6: Stylistic fingerprint (v3)
-        if verbose:
-            print("=" * 50)
-            print("Step 6: Stylistic Fingerprint v3 (production-grade)")
-            print("=" * 50)
-
-        visual_style = analyze_stylistic_fingerprint(
-            shots, transcript, duration,
-            orientation=orientation,
-            reading_level=reading_level,
-        )
-
-        if verbose:
-            print(f"  Rendering Class: {visual_style['rendering_class']}")
-            print(f"  World Type: {visual_style['world_type']}")
-            print(f"  Character Strategy: {visual_style['character_strategy']}")
-            print(f"  Narrative Structure: {visual_style['narrative_structure']}")
-            print(f"  Visual Abstraction: {visual_style['visual_abstraction_index']}")
-            print(f"  Visual Density: {visual_style['visual_density']}")
-            print(f"  Camera/Editing: {visual_style['camera_editing']}")
-            print(f"  Tonal Positioning: {visual_style['tonal_positioning']}")
-
-        # Calculate word count from transcript
-        full_transcript = " ".join([seg.text for seg in transcript])
-        word_count = len(full_transcript.split())
-
-        # Create metadata object
-        metadata = VideoMetadata(
-            title=title,
-            duration=duration,
-            width=width,
-            height=height,
-            orientation=orientation,
-            word_count=word_count,
-            image_count=len(shots),
-            key_details=key_details,
-            reading_level=reading_level,
-            story_structure=story_structure
-        )
+        shots, metadata, visual_style = result.shots, result.metadata, result.visual_style
 
         # Step 7: Generate output
         if verbose:

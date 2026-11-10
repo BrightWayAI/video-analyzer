@@ -23,11 +23,20 @@ Environment:
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import ipaddress
+import logging
 import os
+import re
+import secrets
+import shutil
 import socket
 import sys
+import time
+import zipfile
+from collections import OrderedDict
+from pathlib import Path
 from urllib.parse import urlparse
 
 HOSTED_ENV = "VIDEO_ANALYZER_HOSTED"
@@ -76,6 +85,181 @@ def check_duration(duration: float) -> None:
         raise ValueError(
             f"Video is {duration:.0f}s long; the hosted limit is {max_duration():.0f}s."
         )
+
+
+def max_frames() -> int:
+    """Most frames sent to Claude per video on the hosted server."""
+    return int(os.environ.get("VIDEO_ANALYZER_MAX_FRAMES", "60"))
+
+
+def file_ttl_hours() -> int:
+    return int(os.environ.get("VIDEO_ANALYZER_FILE_TTL_HOURS", "72"))
+
+
+# ---------------------------------------------------------------------------
+# Expiring file links: each job's outputs live in a "bundle" directory served
+# at /files/<bundle-id>/..., where the id is an unguessable random token.
+# ---------------------------------------------------------------------------
+
+_BUNDLE_ID = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+
+
+def files_root() -> Path:
+    return Path(os.environ.get("VIDEO_ANALYZER_FILES_DIR", "/tmp/video-analyzer-files"))
+
+
+def public_base_url() -> str | None:
+    """Where buyers can fetch files from, e.g. https://videomcp.example.com."""
+    url = os.environ.get("PUBLIC_BASE_URL")
+    if not url and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        url = "https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"]
+    return url.rstrip("/") if url else None
+
+
+class Bundle:
+    def __init__(self, bundle_id: str):
+        self.id = bundle_id
+        self.path = files_root() / bundle_id
+
+    @property
+    def url(self) -> str | None:
+        base = public_base_url()
+        return f"{base}/files/{self.id}" if base else None
+
+    def zip_dir(self, subdir: str, zip_name: str) -> Path:
+        src = self.path / subdir
+        out = self.path / zip_name
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(src.glob("*")):
+                if f.is_file():
+                    zf.write(f, f.name)
+        return out
+
+    def discard(self) -> None:
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def sweep_bundles() -> None:
+    """Delete bundles older than the TTL."""
+    root = files_root()
+    if not root.is_dir():
+        return
+    cutoff = time.time() - file_ttl_hours() * 3600
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def new_bundle() -> Bundle:
+    sweep_bundles()
+    bundle = Bundle(secrets.token_urlsafe(24))
+    bundle.path.mkdir(parents=True, exist_ok=True)
+    return bundle
+
+
+def resolve_bundle_file(bundle_id: str, rel_path: str) -> Path | None:
+    """The file a /files URL names, or None if invalid, missing or expired."""
+    if not _BUNDLE_ID.match(bundle_id):
+        return None
+    base = (files_root() / bundle_id).resolve()
+    target = (base / rel_path).resolve()
+    if base not in target.parents or not target.is_file():
+        return None
+    if base.stat().st_mtime < time.time() - file_ttl_hours() * 3600:
+        return None
+    return target
+
+
+async def serve_file(request):
+    from starlette.responses import FileResponse, PlainTextResponse
+
+    target = resolve_bundle_file(request.path_params["bundle"], request.path_params["path"])
+    if target is None:
+        return PlainTextResponse("Not found or expired.", status_code=404)
+    return FileResponse(target, headers={"Cache-Control": "private, max-age=3600"})
+
+
+async def healthz(request):
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
+
+
+# ---------------------------------------------------------------------------
+# Result cache: a retry of the same call (e.g. after a dropped connection)
+# returns the finished result instead of paying for the analysis twice.
+# ---------------------------------------------------------------------------
+
+_cache: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+_CACHE_MAX = 200
+
+
+def _cache_ttl() -> float:
+    return float(os.environ.get("VIDEO_ANALYZER_CACHE_HOURS", "24")) * 3600
+
+
+async def cached_call(tool: str, params, compute):
+    key = hashlib.sha256(f"{tool}:{params.model_dump_json()}".encode()).hexdigest()
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < min(_cache_ttl(), file_ttl_hours() * 3600):
+        _cache.move_to_end(key)
+        log.info("cache hit tool=%s", tool)
+        return hit[1]
+    result = await compute()
+    _cache[key] = (time.time(), result)
+    while len(_cache) > _CACHE_MAX:
+        _cache.popitem(last=False)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Logging: one line per step with timings, so Railway's logs show where a
+# slow or failed job spent its time.
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger("video_analyzer")
+
+
+class _JobLog:
+    def __init__(self, tool: str, url: str):
+        self.id = secrets.token_hex(4)
+        self.tool = tool
+        self.host = urlparse(url if "://" in url else "https://" + url).hostname or "local"
+        self.t0 = self.last = time.monotonic()
+
+    def step(self, name: str, **fields):
+        now = time.monotonic()
+        extra = " ".join(f"{k}={v}" for k, v in fields.items())
+        log.info("job=%s tool=%s step=%s took=%.1fs %s", self.id, self.tool, name, now - self.last, extra)
+        self.last = now
+
+
+@contextlib.asynccontextmanager
+async def job_log(tool: str, url: str):
+    job = _JobLog(tool, url)
+    log.info("job=%s tool=%s start host=%s", job.id, tool, job.host)
+    try:
+        yield job
+    except Exception as e:
+        log.warning("job=%s tool=%s failed after %.1fs: %s", job.id, tool, time.monotonic() - job.t0, e)
+        raise
+    log.info("job=%s tool=%s done total=%.1fs", job.id, tool, time.monotonic() - job.t0)
+
+
+def _setup_observability() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    dsn = os.environ.get("SENTRY_DSN")
+    if dsn:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(dsn=dsn, traces_sample_rate=0.0, send_default_pii=False)
+            log.info("Sentry error reporting on")
+        except ImportError:
+            log.warning("SENTRY_DSN is set but sentry-sdk isn't installed")
 
 
 _slots: asyncio.Semaphore | None = None
@@ -129,6 +313,10 @@ def build_app():
     mcp.settings.transport_security = None
     mcp.settings.stateless_http = True
 
+    # Public routes (no token): health check, and job files behind random ids.
+    mcp.custom_route("/healthz", methods=["GET"])(healthz)
+    mcp.custom_route("/files/{bundle}/{path:path}", methods=["GET"])(serve_file)
+
     app = mcp.streamable_http_app()
     app.add_middleware(BaseHTTPMiddleware, dispatch=mcprush_only)
     return app
@@ -141,6 +329,9 @@ def http_main():
 
     import uvicorn
 
+    _setup_observability()
+    if not public_base_url():
+        log.warning("PUBLIC_BASE_URL not set: results won't include file links")
     uvicorn.run(build_app(), host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
 
 

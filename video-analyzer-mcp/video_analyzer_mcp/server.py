@@ -688,8 +688,12 @@ if not hosted.is_hosted():
 
 def _error_suggestion(e: Exception) -> str:
     """Return a helpful suggestion based on the error type."""
+    import subprocess
+
     msg = str(e).lower()
-    if "ffmpeg" in msg or "ffprobe" in msg:
+    if isinstance(e, subprocess.CalledProcessError) and ("ffmpeg" in msg or "ffprobe" in msg):
+        return "FFmpeg couldn't read this video. It may be corrupt or in an unsupported format; try another copy or a different link."
+    if isinstance(e, FileNotFoundError) and ("ffmpeg" in msg or "ffprobe" in msg):
         return "FFmpeg is not installed. Install it: brew install ffmpeg (macOS) or apt-get install ffmpeg (Linux)"
     if "anthropic_api_key" in msg or "api_key" in msg:
         return "Set the ANTHROPIC_API_KEY environment variable before running the server."

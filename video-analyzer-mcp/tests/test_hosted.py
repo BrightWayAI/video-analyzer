@@ -244,3 +244,12 @@ def test_extract_frame_raises_when_all_fail(monkeypatch):
                         lambda cmd, capture_output=True: SimpleNamespace(returncode=1, args=cmd, stdout=b"", stderr=b"x"))
     with pytest.raises(av.subprocess.CalledProcessError):
         av.extract_frame_at_time("v.mp4", 5.0, "/nonexistent/f.jpg")
+
+
+def test_ffmpeg_failure_hint_is_not_missing_install():
+    import subprocess
+    from video_analyzer_mcp.server import _error_suggestion
+
+    failed = subprocess.CalledProcessError(234, ["ffmpeg", "-i", "x"])
+    assert "not installed" not in _error_suggestion(failed)
+    assert "not installed" in _error_suggestion(FileNotFoundError("[Errno 2] No such file or directory: 'ffmpeg'"))

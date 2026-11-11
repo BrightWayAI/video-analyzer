@@ -220,3 +220,27 @@ def test_contact_sheet(tmp_path):
     out = av.make_contact_sheet(shots, str(tmp_path / "sheet.jpg"))
     im = Image.open(out)
     assert im.width == 4 * (320 + 8) + 8 and im.height > 2 * 180
+
+
+def test_extract_frame_steps_back_past_end(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, capture_output=True):
+        calls.append(cmd)
+        out = cmd[-2]
+        ok = len(calls) == 2  # first seek lands past the last frame
+        if ok:
+            open(out, "wb").write(b"jpg")
+        return SimpleNamespace(returncode=0 if ok else 234, args=cmd, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(av.subprocess, "run", fake_run)
+    out = tmp_path / "f.jpg"
+    assert av.extract_frame_at_time("v.mp4", 32.495, str(out)) == str(out)
+    assert calls[1][1:3] == ["-ss", "31.495"]
+
+
+def test_extract_frame_raises_when_all_fail(monkeypatch):
+    monkeypatch.setattr(av.subprocess, "run",
+                        lambda cmd, capture_output=True: SimpleNamespace(returncode=1, args=cmd, stdout=b"", stderr=b"x"))
+    with pytest.raises(av.subprocess.CalledProcessError):
+        av.extract_frame_at_time("v.mp4", 5.0, "/nonexistent/f.jpg")

@@ -402,20 +402,26 @@ def extract_frame_at_time(
     timestamp: float,
     output_path: str
 ) -> str:
-    """Extract a single frame at a specific timestamp."""
-    subprocess.run(
-        [
-            "ffmpeg", "-ss", str(timestamp),
-            "-i", video_path,
-            "-frames:v", "1",
-            "-q:v", "2",
-            output_path,
-            "-y"
-        ],
-        check=True,
-        capture_output=True
+    """Extract a single frame at a specific timestamp.
+
+    The container duration can run past the last video frame (audio is often
+    longer), and a seek past it writes nothing. So if a seek yields no frame,
+    step back and try again, finally taking the last frame of the video.
+    """
+    attempts = [["-ss", f"{t:.3f}"] for t in (timestamp, timestamp - 1.0, timestamp - 3.0) if t >= 0]
+    attempts.append(["-sseof", "-1"])
+    last_error = None
+    for seek in attempts:
+        result = subprocess.run(
+            ["ffmpeg", *seek, "-i", video_path, "-frames:v", "1", "-q:v", "2", output_path, "-y"],
+            capture_output=True,
+        )
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+        last_error = result
+    raise subprocess.CalledProcessError(
+        last_error.returncode, last_error.args, last_error.stdout, last_error.stderr
     )
-    return output_path
 
 
 # =============================================================================

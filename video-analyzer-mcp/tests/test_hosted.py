@@ -253,3 +253,12 @@ def test_ffmpeg_failure_hint_is_not_missing_install():
     failed = subprocess.CalledProcessError(234, ["ffmpeg", "-i", "x"])
     assert "not installed" not in _error_suggestion(failed)
     assert "not installed" in _error_suggestion(FileNotFoundError("[Errno 2] No such file or directory: 'ffmpeg'"))
+
+
+def test_whisper_hallucinations_dropped():
+    # Scores Whisper gave the music-only Big Buck Bunny trailer
+    assert av._likely_not_speech({"no_speech_prob": 0.48, "avg_logprob": -2.58, "compression_ratio": 0.81})
+    assert av._likely_not_speech({"no_speech_prob": 0.72, "avg_logprob": -0.93, "compression_ratio": 0.27})
+    # Ordinary narration stays
+    assert not av._likely_not_speech({"no_speech_prob": 0.02, "avg_logprob": -0.25, "compression_ratio": 1.5})
+    assert not av._likely_not_speech({"no_speech_prob": 0.6, "avg_logprob": -0.3, "compression_ratio": 1.4})

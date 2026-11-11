@@ -580,6 +580,18 @@ def _whisper_model(model_size: str):
         return _WHISPER_MODELS[model_size]
 
 
+def _likely_not_speech(segment: dict) -> bool:
+    """Whisper invents words over music and silence; drop segments its own
+    scores mark as probably not speech, or as repetitive filler."""
+    no_speech = segment.get("no_speech_prob", 0.0)
+    logprob = segment.get("avg_logprob", 0.0)
+    if no_speech > 0.5 and logprob < -0.7:
+        return True
+    if logprob < -1.2:
+        return True
+    return segment.get("compression_ratio", 0.0) > 2.4
+
+
 def transcribe_audio(
     video_path: str,
     model_size: str = "base",
@@ -605,6 +617,8 @@ def transcribe_audio(
     # Convert to TranscriptSegment objects
     segments = []
     for segment in result["segments"]:
+        if _likely_not_speech(segment):
+            continue
         ts = TranscriptSegment(
             start_time=segment["start"],
             end_time=segment["end"],

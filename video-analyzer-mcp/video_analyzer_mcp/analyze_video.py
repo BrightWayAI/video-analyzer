@@ -2101,23 +2101,19 @@ def analyze_video_file(
     if verbose:
         print(f"Created {len(shots)} shots")
 
-    _progress(0.35, "Transcribing audio")
-    # Step 3: Transcribe audio
+    _progress(0.35, "Transcribing audio and analyzing frames with Claude")
+    # Steps 3 + 4: transcription (local CPU) and frame analysis (Claude API
+    # calls) don't depend on each other, so run them side by side.
     if verbose:
         print("=" * 50)
-        print("Step 3: Audio transcription")
+        print("Steps 3-4: Audio transcription + visual analysis with Claude")
         print("=" * 50)
 
-    transcript = transcribe_audio(video_path, verbose=verbose)
-
-    _progress(0.5, "Analyzing frames with Claude")
-    # Step 4: Analyze visuals with Claude
-    if verbose:
-        print("=" * 50)
-        print("Step 4: Visual analysis with Claude")
-        print("=" * 50)
-
-    shots = analyze_all_frames(shots, orientation, verbose, max_frames=max_frames)
+    with ThreadPoolExecutor(max_workers=1) as audio_pool:
+        transcript_job = audio_pool.submit(transcribe_audio, video_path, verbose=verbose)
+        shots = analyze_all_frames(shots, orientation, verbose, max_frames=max_frames)
+        _progress(0.7, "Finishing transcription")
+        transcript = transcript_job.result()
 
     # Step 5: Align transcript to shots
     if verbose:

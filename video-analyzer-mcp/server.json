@@ -35,6 +35,10 @@
       "description": "8-field Stylistic Fingerprint v3: rendering, world, characters, narrative, abstraction, density, editing, tone"
     },
     {
+      "name": "video_compare",
+      "description": "Compare two videos side by side: fingerprint, pacing, hook and structure, plus what each could borrow from the other (hosted)"
+    },
+    {
       "name": "video_check_deps",
       "description": "Verify FFmpeg, Whisper and the other local dependencies are installed (local installs only)"
     }

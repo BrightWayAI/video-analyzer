@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from video_analyzer_mcp import analyze_video as av
 from video_analyzer_mcp import hosted
+from video_analyzer_mcp.pdf_storyboard import generate_pdf_storyboard
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -122,6 +123,29 @@ class TranscribeInput(BaseModel):
         default=None,
         description="Path to cookies.txt for authenticated downloads",
     )
+
+
+class CompareVideosInput(BaseModel):
+    """Input for comparing two videos."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    video_a: str = Field(..., description="First video: a URL (YouTube, Shorts, TikTok, direct link) or local file", min_length=1)
+    video_b: str = Field(..., description="Second video to compare against the first", min_length=1)
+    interval: Optional[float] = Field(
+        default=None,
+        description="Extract frames every N seconds instead of using scene detection. Leave empty for automatic scene detection.",
+        gt=0,
+    )
+
+    @field_validator("video_a", "video_b")
+    @classmethod
+    def validate_input(cls, v: str) -> str:
+        v = v.strip()
+        if hosted.is_hosted():
+            hosted.validate_remote_url(v)
+        elif not av.is_url(v) and not os.path.isfile(v):
+            raise ValueError(f"File not found: {v}")
+        return v
 
 
 class FingerprintInput(BaseModel):
@@ -348,20 +372,20 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context):
     }, indent=2)
 
 
-async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
-    """Hosted pipeline: results inline, files behind expiring private links."""
-    _check_deps()
-    async with hosted.job_slot(), hosted.job_log("video_analyze", params.input_path) as log:
+async def _hosted_pipeline(url: str, interval: Optional[float], progress: "_Progress", tool: str) -> dict:
+    """Download, analyze and write every output for one video into a new
+    bundle. Returns {result, bundle, markdown, sheet}."""
+    async with hosted.job_slot(), hosted.job_log(tool, url) as log:
         await progress.report(0.02, "Downloading video")
         bundle = hosted.new_bundle()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                video_path, title = await progress.run(_resolve_video, params.input_path, temp_dir)
+                video_path, title = await progress.run(_resolve_video, url, temp_dir)
                 log.step("download")
                 result = await progress.run(
                     av.analyze_video_file,
                     video_path, title, str(bundle.path / "frames"),
-                    interval=params.interval,
+                    interval=interval,
                     max_duration=hosted.max_duration(),
                     max_frames=hosted.max_frames(),
                     progress=progress.callback,
@@ -376,16 +400,21 @@ async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
         markdown = await _run(av.generate_markdown_output, shots, meta, str(bundle.path / "frames"), style, result.pacing)
         await _run(av.generate_docx_output, shots, meta, str(bundle.path / "storyboard.docx"), style, result.pacing)
         sheet = await _run(av.make_contact_sheet, shots, str(bundle.path / "contact_sheet.jpg"))
+        await _run(generate_pdf_storyboard, shots, meta, str(bundle.path / "storyboard.pdf"),
+                   style, result.pacing, sheet)
         await _run(bundle.zip_dir, "frames", "frames.zip")
         log.step("outputs")
+    return {"result": result, "bundle": bundle, "markdown": markdown, "sheet": sheet}
 
-    base = bundle.url
+
+def _video_summary(run: dict) -> dict:
+    result, base = run["result"], run["bundle"].url
+    meta, style = result.metadata, result.visual_style
     summary = {
-        "status": "success",
         "title": meta.title,
         "duration_seconds": round(meta.duration, 1),
         "orientation": meta.orientation,
-        "shots": len(shots),
+        "shots": len(result.shots),
         "frames_analyzed": result.frames_analyzed,
         "reading_level": meta.reading_level,
         "story_structure": meta.story_structure,
@@ -394,16 +423,26 @@ async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
     }
     if base:
         summary["files"] = {
+            "storyboard_pdf": f"{base}/storyboard.pdf",
             "storyboard_docx": f"{base}/storyboard.docx",
             "contact_sheet": f"{base}/contact_sheet.jpg",
             "frames_zip": f"{base}/frames.zip",
             "links_expire_after_hours": hosted.file_ttl_hours(),
         }
-    inline_sheet = await _run(hosted.shrink_jpeg, sheet) if sheet else None
+    return summary
+
+
+async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
+    """Hosted pipeline: results inline, files behind expiring private links."""
+    _check_deps()
+    run = await _hosted_pipeline(params.input_path, params.interval, progress, "video_analyze")
+    summary = {"status": "success", **_video_summary(run)}
+    base = run["bundle"].url
+    inline_sheet = await _run(hosted.shrink_jpeg, run["sheet"]) if run["sheet"] else None
     return hosted.fit_response(
-        [json.dumps(summary, indent=2), _frames_url_rewrite(markdown, base)],
+        [json.dumps(summary, indent=2), _frames_url_rewrite(run["markdown"], base)],
         inline_sheet,
-        docs_hint="The full storyboard is in the storyboard_docx link above." if base else "",
+        docs_hint="The full storyboard is in the storyboard_pdf link above." if base else "",
     )
 
 
@@ -638,6 +677,180 @@ async def _fingerprint(params: FingerprintInput, progress: "_Progress"):
         "fingerprint": {k: v for k, v in result.visual_style.items() if not k.startswith("legacy_")},
         "pacing": result.pacing,
     }, indent=2)
+
+
+_COMPARE_ROWS = [
+    ("Duration", lambda v: f"{v['duration_seconds']}s {v['orientation']}"),
+    ("Shots", lambda v: v["shots"]),
+    ("Cuts per minute", lambda v: (v["pacing"] or {}).get("cuts_per_minute")),
+    ("Average shot", lambda v: f"{(v['pacing'] or {}).get('average_shot_seconds')}s"),
+    ("First cut", lambda v: f"{(v['pacing'] or {}).get('first_cut_at_seconds')}s"),
+    ("Words per minute", lambda v: (v["pacing"] or {}).get("words_per_minute") or "little speech"),
+    ("Words in first 3s", lambda v: ((v["pacing"] or {}).get("hook") or {}).get("words_spoken")),
+    ("Rendering", lambda v: v["fingerprint"].get("rendering_class")),
+    ("World", lambda v: v["fingerprint"].get("world_type")),
+    ("Characters", lambda v: v["fingerprint"].get("character_strategy")),
+    ("Narrative", lambda v: v["fingerprint"].get("narrative_structure")),
+    ("Abstraction", lambda v: v["fingerprint"].get("visual_abstraction_index")),
+    ("Density", lambda v: v["fingerprint"].get("visual_density")),
+    ("Camera / editing", lambda v: v["fingerprint"].get("camera_editing")),
+    ("Tone", lambda v: v["fingerprint"].get("tonal_positioning")),
+]
+
+
+def compare_table(a: dict, b: dict) -> str:
+    """Side-by-side Markdown table; rows that differ are marked."""
+    def cell(x):
+        return str(x).replace("|", "\\|")
+    lines = ["| | Video A | Video B | |", "|---|---|---|---|"]
+    for label, get in _COMPARE_ROWS:
+        va, vb = get(a), get(b)
+        mark = "≠" if va != vb else ""
+        lines.append(f"| **{label}** | {cell(va)} | {cell(vb)} | {mark} |")
+    return "\n".join(lines)
+
+
+def _compare_brief(run: dict, summary: dict, limit_shots: int = 14) -> str:
+    result = run["result"]
+    shots = [sh for sh in result.shots if sh.visual_description][:limit_shots]
+    shot_lines = "\n".join(
+        f"- {sh.timestamp_str}: {sh.visual_description}"
+        + (f" [on screen: {sh.on_screen_text}]" if sh.on_screen_text else "")
+        for sh in shots
+    )
+    words = " ".join(seg.text for seg in result.transcript)
+    return (
+        f"Title: {summary['title']}\n"
+        f"Story structure: {summary['story_structure']}\n"
+        f"Fingerprint: {json.dumps(summary['fingerprint'])}\n"
+        f"Pacing: {json.dumps(summary['pacing'])}\n"
+        f"Shots:\n{shot_lines}\n"
+        f"Transcript (start): {words[:1500]}"
+    )
+
+
+def compare_narrative(run_a: dict, run_b: dict, sum_a: dict, sum_b: dict) -> str:
+    """A short creator-facing comparison written by Claude."""
+    client = av.anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    prompt = f"""Compare these two videos for a creator who wants to learn from them.
+
+VIDEO A
+{_compare_brief(run_a, sum_a)}
+
+VIDEO B
+{_compare_brief(run_b, sum_b)}
+
+Write Markdown, under 350 words, with exactly these sections:
+### Biggest differences
+3-5 bullets on style, pacing, hook and structure, citing the numbers above.
+### What each does better
+One short paragraph each for A and B.
+### What B could borrow from A
+3 concrete, specific bullets.
+### What A could borrow from B
+3 concrete, specific bullets.
+Be specific to these videos; no generic advice."""
+    return av._claude_text(client, prompt, max_tokens=1500)
+
+
+class _PairProgress:
+    """Combines two videos' progress into one job status."""
+    def __init__(self, job):
+        self.job = job
+        self.state = {"A": (0.0, "Queued"), "B": (0.0, "Queued")}
+
+    def side(self, key: str):
+        outer = self
+
+        class _Side:
+            def update(self, frac, msg):
+                outer.state[key] = (frac, msg)
+                if outer.job is not None:
+                    (fa, ma), (fb, mb) = outer.state["A"], outer.state["B"]
+                    outer.job.update(0.9 * (fa + fb) / 2, f"Video A: {ma}; video B: {mb}")
+        return _Side()
+
+
+@mcp.tool(
+    name="video_compare",
+    structured_output=False,
+    annotations={
+        "title": "Compare Two Videos",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def video_compare(params: CompareVideosInput, ctx: Context):
+    """Compare two videos side by side: style fingerprint, pacing, hook and
+    story structure, plus a written breakdown of the biggest differences and
+    what each video could borrow from the other.
+
+    Good for "my video vs. the one that went viral", or matching a reference.
+    Both videos are fully analyzed, so links to each one's PDF storyboard come
+    back too. Takes a few minutes.
+    """
+    if not hosted.is_hosted():
+        raise ValueError("video_compare runs on the hosted server; locally, run video_analyze on each video.")
+    return await hosted.run_job("video_compare", params, lambda job: _compare_hosted(params, job))
+
+
+async def _compare_hosted(params: CompareVideosInput, job):
+    import asyncio
+
+    _check_deps()
+    pair = _PairProgress(job)
+    run_a, run_b = await asyncio.gather(
+        _hosted_pipeline(params.video_a, params.interval, _Progress(None, job=pair.side("A")), "video_compare"),
+        _hosted_pipeline(params.video_b, params.interval, _Progress(None, job=pair.side("B")), "video_compare"),
+    )
+    if job is not None:
+        job.update(0.92, "Writing the comparison")
+    sum_a, sum_b = _video_summary(run_a), _video_summary(run_b)
+    try:
+        narrative = await _run(compare_narrative, run_a, run_b, sum_a, sum_b)
+    except Exception as e:  # the numbers are still worth returning
+        narrative = f"(The written comparison failed: {e})"
+
+    summary = {
+        "status": "success",
+        "video_a": sum_a,
+        "video_b": sum_b,
+        "differs_on": [label for label, get in _COMPARE_ROWS if get(sum_a) != get(sum_b)],
+    }
+    report = (
+        f"# {sum_a['title']}  vs.  {sum_b['title']}\n\n"
+        + compare_table(sum_a, sum_b)
+        + "\n\n"
+        + (narrative or "")
+    )
+    sheets = []
+    for run in (run_a, run_b):
+        if run["sheet"]:
+            sheets.append(await _run(hosted.shrink_jpeg, run["sheet"], 800, 60_000))
+    combined = _side_by_side(sheets) if len(sheets) == 2 and all(sheets) else None
+    return hosted.fit_response([json.dumps(summary, indent=2), report], combined)
+
+
+def _side_by_side(jpegs: list[bytes]) -> Optional[bytes]:
+    """Two contact sheets next to each other, labelled A and B, as one JPEG."""
+    import io
+    from PIL import Image as PILImage, ImageDraw
+
+    imgs = [PILImage.open(io.BytesIO(b)).convert("RGB") for b in jpegs]
+    h = max(i.height for i in imgs)
+    gap, label_h = 16, 28
+    out = PILImage.new("RGB", (sum(i.width for i in imgs) + gap, h + label_h), "white")
+    x = 0
+    draw = ImageDraw.Draw(out)
+    for name, im in zip(("A", "B"), imgs):
+        draw.text((x + 6, 6), f"Video {name}", fill=(30, 30, 30))
+        out.paste(im, (x, label_h))
+        x += im.width + gap
+    buf = io.BytesIO()
+    out.save(buf, "JPEG", quality=70, optimize=True)
+    return buf.getvalue() if buf.tell() <= 140_000 else None
 
 
 async def video_check_deps() -> str:

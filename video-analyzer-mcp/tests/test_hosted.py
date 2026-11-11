@@ -482,3 +482,71 @@ def test_docx_includes_pacing_and_on_screen_text(tmp_path):
     av.generate_docx_output(shots, meta, str(out), None, av.pacing_stats(shots, [], 2.0))
     text = "\n".join(c.text for t in Document(str(out)).tables for r in t.rows for c in r.cells)
     assert "Cuts per minute" in text and "ONE BIG RABBIT" in text
+
+
+def test_pdf_storyboard_renders(tmp_path):
+    from PIL import Image as PILImage
+    from video_analyzer_mcp.pdf_storyboard import generate_pdf_storyboard
+
+    shots = []
+    for i in range(8):
+        f = tmp_path / f"shot_{i}.jpg"
+        PILImage.new("RGB", (320, 180), (40 * i, 90, 160)).save(f)
+        shots.append(av.Shot(number=i + 1, start_time=i * 2, end_time=i * 2 + 2, frame_path=str(f),
+                             visual_description="Live-action footage. A dog on a boat → smiling.",
+                             on_screen_text='"POV"' if i == 0 else "", dialogue="hello there"))
+    meta = av.VideoMetadata(title="Test – video", duration=16.0, width=320, height=180,
+                            orientation="horizontal", word_count=2, image_count=8)
+    out = generate_pdf_storyboard(shots, meta, str(tmp_path / "s.pdf"), None, av.pacing_stats(shots, [], 16.0))
+    data = open(out, "rb").read()
+    assert data.startswith(b"%PDF") and data.count(b"/Type /Page\n") + data.count(b"/Type /Page ") >= 3
+
+
+def _fake_run(tmp_path, name, cuts, rendering):
+    from PIL import Image as PILImage
+
+    shots = [av.Shot(number=i + 1, start_time=i * 2.0, end_time=i * 2.0 + 2, visual_description=f"{rendering} shot {i}")
+             for i in range(cuts)]
+    meta = av.VideoMetadata(title=name, duration=cuts * 2.0, width=720, height=1280, orientation="vertical",
+                            word_count=0, image_count=cuts, story_structure="Montage")
+    result = av.PipelineResult(shots, meta, {"rendering_class": rendering, "tonal_positioning": "Gen Z Social"},
+                               [], cuts, av.pacing_stats(shots, [], cuts * 2.0))
+    sheet = tmp_path / f"{name}.jpg"
+    PILImage.new("RGB", (640, 900), (200, 80, 80)).save(sheet)
+    return {"result": result, "bundle": SimpleNamespace(url=f"https://x/files/{name}"), "markdown": "", "sheet": str(sheet)}
+
+
+def test_compare_table_marks_differences(tmp_path):
+    from video_analyzer_mcp import server
+
+    a = server._video_summary(_fake_run(tmp_path, "a", 5, "Live Action (filmed footage)"))
+    b = server._video_summary(_fake_run(tmp_path, "b", 5, "Flat 2D"))
+    table = server.compare_table(a, b)
+    rendering = next(l for l in table.splitlines() if "**Rendering**" in l)
+    tone = next(l for l in table.splitlines() if "**Tone**" in l)
+    assert rendering.endswith("| ≠ |") and tone.endswith("|  |")
+
+
+def test_compare_job_end_to_end(tmp_path, monkeypatch):
+    from video_analyzer_mcp import server
+
+    hosted._jobs.clear()
+    runs = {"https://e.com/a": _fake_run(tmp_path, "a", 4, "Flat 2D"),
+            "https://e.com/b": _fake_run(tmp_path, "b", 8, "Live Action (filmed footage)")}
+
+    async def fake_pipeline(url, interval, progress, tool):
+        await progress.report(0.5, "Analyzing frames with Claude")
+        return runs[url]
+
+    monkeypatch.setattr(server, "_hosted_pipeline", fake_pipeline)
+    monkeypatch.setattr(server, "_check_deps", lambda: None)
+    monkeypatch.setattr(server, "compare_narrative", lambda *a: "### Biggest differences\n- B cuts twice as often")
+    monkeypatch.setattr(hosted, "validate_remote_url", lambda url: None)
+
+    params = server.CompareVideosInput(video_a="https://e.com/a", video_b="https://e.com/b")
+    result = asyncio.run(hosted.run_job("video_compare", params, lambda job: server._compare_hosted(params, job)))
+    summary = __import__("json").loads(result.content[0].text)
+    assert summary["video_a"]["title"] == "a" and summary["video_b"]["shots"] == 8
+    assert "Rendering" in summary["differs_on"] and "Shots" in summary["differs_on"]
+    assert "B cuts twice as often" in result.content[1].text
+    assert result.content[-1].type == "image"

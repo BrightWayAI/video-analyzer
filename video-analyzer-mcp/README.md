@@ -18,10 +18,11 @@ More examples, who it's for and how it works: [the project README on GitHub](htt
 
 | Tool | What it does |
 |------|-------------|
-| `video_analyze` | The full breakdown: storyboard, contact sheet, fingerprint, transcript, Word file and frames |
-| `video_extract_frames` | One frame per shot via scene detection (or fixed intervals), fast, no AI write-up |
-| `video_transcribe` | Timestamped transcript (Whisper, runs locally, no OpenAI key) |
-| `video_fingerprint` | Just the eight-field stylistic classification |
+| `video_analyze` | The full breakdown: storyboard, contact sheet, fingerprint, pacing & hook, on-screen text, transcript, PDF and Word storyboards, frames |
+| `video_extract_frames` | One frame per shot via scene detection (or fixed intervals) with pacing stats, fast, no AI write-up |
+| `video_transcribe` | Timestamped transcript (faster-whisper, runs locally, no OpenAI key) |
+| `video_fingerprint` | Just the eight-field stylistic classification, with pacing stats |
+| `video_compare` | Two videos side by side, with a written breakdown of what to borrow (hosted server) |
 | `video_check_deps` | Checks FFmpeg, Whisper and friends are installed (self-hosted only) |
 
 ## Hosted: nothing to install
@@ -65,6 +66,7 @@ Then ask your assistant:
 - *"Pull one frame per shot from this TikTok"* → `video_extract_frames`
 - *"Transcribe this video"* → `video_transcribe`
 - *"What's the visual style of this video?"* → `video_fingerprint`
+- *"Compare my video with this one that went viral"* → `video_compare`
 
 ## Hosted mode (remote HTTP)
 
@@ -105,7 +107,7 @@ docker run -p 8000:8000 \
 
 Long jobs: every hosted tool runs as a background job keyed by its arguments. A call waits up to `VIDEO_ANALYZER_WAIT_SECONDS`; if the job isn't finished it answers `isError` with "STILL WORKING … call again with exactly the same arguments". mcprush doesn't count `isError` answers, so the buyer pays for the one call that returns the result. Answers are plain JSON (no SSE stream) and kept under mcprush's 256 KiB cap: the inline contact sheet is shrunk, and dropped (then the storyboard shortened) if needed.
 
-Hosted results: `video_analyze` returns a JSON summary (with the fingerprint and file links), the storyboard as Markdown with working image links, and a contact-sheet image. `video_extract_frames` returns shots with `frame_url`s and a contact sheet. `/healthz` answers `ok` for health checks.
+Hosted results: `video_analyze` returns a JSON summary (with the fingerprint, pacing & hook, and links to the PDF and Word storyboards), the storyboard as Markdown with working image links, and a contact-sheet image. `video_extract_frames` returns shots with `frame_url`s and a contact sheet. `/healthz` answers `ok` for health checks.
 
 ## Stylistic Fingerprint Fields
 

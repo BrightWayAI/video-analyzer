@@ -23,9 +23,13 @@
 |---|---|
 | 🎞️ **Shot-by-shot storyboard** | Every scene with its timestamp, its frame, a production-ready visual description and the dialogue over it, as Markdown and as a Word document |
 | 🖼️ **Contact sheet** | Every shot in one image, so you and your assistant see the whole video at a glance |
+| ⏱️ **Pacing & hook** | Cuts per minute, shot lengths, time to first cut, words per minute, and exactly what happens in the first 3 seconds |
+| 🔤 **On-screen text** | Captions, titles and stickers read off every shot, word for word |
 | 🧬 **Stylistic Fingerprint** | Eight labels that pin down the look and feel: rendering, world, characters, narrative, abstraction, density, editing, tone |
 | 🗣️ **Transcript** | Timestamped, with music-only stretches left out instead of guessed at |
+| 📄 **PDF and Word storyboards** | A storyboard sheet with every frame, ready to send to a client, plus an editable .docx |
 | 📦 **Every frame** | As images and as a zip, ready for a deck, a mood board or an editor |
+| 🆚 **Compare two videos** | Side-by-side style, pacing and hook, plus what each could borrow from the other |
 
 ### Real output
 
@@ -94,10 +98,11 @@ To host it for others (Docker, Railway, mcprush gateway), see [the server's READ
 
 | Tool | What it does |
 |---|---|
-| `video_analyze` | The full breakdown: storyboard, contact sheet, fingerprint, transcript, Word file and frames |
-| `video_extract_frames` | One frame per shot via scene detection (or fixed intervals), fast, no AI write-up |
+| `video_analyze` | The full breakdown: storyboard, contact sheet, fingerprint, pacing & hook, on-screen text, transcript, PDF and Word storyboards, frames |
+| `video_extract_frames` | One frame per shot via scene detection (or fixed intervals) with pacing stats, fast, no AI write-up |
 | `video_transcribe` | Timestamped transcript (Whisper, runs locally) |
-| `video_fingerprint` | Just the eight-field stylistic classification |
+| `video_fingerprint` | Just the eight-field stylistic classification, with pacing stats |
+| `video_compare` | Two videos side by side, with a written breakdown of what to borrow (hosted) |
 | `video_check_deps` | Checks FFmpeg, Whisper and friends are installed (self-hosted only) |
 
 ## The Stylistic Fingerprint
@@ -119,8 +124,8 @@ A deterministic classifier over the shot descriptions and transcript, so the sam
 
 1. **Download**: yt-dlp fetches the video (720p is plenty for analysis)
 2. **Find the shots**: PySceneDetect finds every cut, and FFmpeg pulls the middle frame of each shot
-3. **Look and listen, in parallel**: Claude Vision describes each frame while Whisper transcribes the audio
-4. **Write it up**: Claude reads the shots and transcript for reading level and story structure, the fingerprint classifier labels the style, and the storyboard is written as Markdown and `.docx`
+3. **Look and listen, in parallel**: Claude Vision describes each frame and reads its on-screen text while faster-whisper transcribes the speech
+4. **Write it up**: Claude reads the shots and transcript for reading level and story structure, the fingerprint classifier labels the style, pacing and hook stats come from the shot timings, and the storyboard is written as Markdown, PDF and `.docx`
 
 ## Standalone script
 

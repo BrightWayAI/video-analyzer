@@ -25,9 +25,12 @@ from typing import Optional
 
 # Third-party imports - these will fail gracefully with helpful messages
 try:
-    import whisper
+    # faster-whisper (CTranslate2): same Whisper models, 3-4x faster on CPU,
+    # no PyTorch.
+    from faster_whisper import WhisperModel
 except ImportError:
-    whisper = None
+    WhisperModel = None
+whisper = WhisperModel  # kept for dependency checks
 
 try:
     from scenedetect import detect, ContentDetector, AdaptiveDetector
@@ -103,6 +106,7 @@ class Shot:
     frame_path: Optional[str] = None
     visual_description: str = ""
     dialogue: str = ""
+    on_screen_text: str = ""  # captions, titles and labels visible in the frame, verbatim
 
     @property
     def timestamp_str(self) -> str:
@@ -174,7 +178,7 @@ def check_dependencies() -> list[str]:
 
     # Check Python packages
     if whisper is None:
-        missing.append("openai-whisper")
+        missing.append("faster-whisper")
     if detect is None:
         missing.append("scenedetect[opencv]")
     if anthropic is None:
@@ -622,7 +626,10 @@ def _whisper_model(model_size: str):
     """Load each Whisper model once per process instead of on every call."""
     with _WHISPER_LOCK:
         if model_size not in _WHISPER_MODELS:
-            _WHISPER_MODELS[model_size] = whisper.load_model(model_size)
+            name = {"large": "large-v3"}.get(model_size, model_size)
+            _WHISPER_MODELS[model_size] = WhisperModel(
+                name, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4
+            )
         return _WHISPER_MODELS[model_size]
 
 
@@ -644,13 +651,13 @@ def transcribe_audio(
     verbose: bool = False
 ) -> list[TranscriptSegment]:
     """
-    Transcribe audio using OpenAI Whisper.
+    Transcribe audio with Whisper (faster-whisper).
 
     Returns:
         List of TranscriptSegment objects with timestamps
     """
     if whisper is None:
-        raise ImportError("openai-whisper is required for transcription")
+        raise ImportError("faster-whisper is required for transcription")
 
     if verbose:
         print(f"Transcribing audio using Whisper ({model_size} model)...")
@@ -658,12 +665,22 @@ def transcribe_audio(
     model = _whisper_model(model_size)
     # Whisper models aren't safe to share across threads mid-transcription
     with _WHISPER_LOCK:
-        result = model.transcribe(video_path, fp16=False, verbose=verbose)
+        # vad_filter skips music and silence before decoding; the score
+        # filter below catches what slips through.
+        raw, _info = model.transcribe(
+            video_path, beam_size=5, vad_filter=True, condition_on_previous_text=False
+        )
+        raw = [
+            {"start": s.start, "end": s.end, "text": s.text,
+             "no_speech_prob": s.no_speech_prob, "avg_logprob": s.avg_logprob,
+             "compression_ratio": s.compression_ratio}
+            for s in raw  # a generator: decoding happens here, inside the lock
+        ]
 
     # Convert to TranscriptSegment objects
     segments = []
-    for segment in result["segments"]:
-        if _likely_not_speech(segment):
+    for segment in raw:
+        if _likely_not_speech(segment) or not segment["text"].strip():
             continue
         ts = TranscriptSegment(
             start_time=segment["start"],
@@ -784,7 +801,9 @@ Example outputs:
 - "2D cartoon style. Bright classroom interior. Young Black girl with pigtails in yellow dress sits at wooden desk, pencil in hand, looking up thoughtfully. Warm natural lighting from windows. Medium shot."
 - "Colorful flat animation. Forest clearing at sunset. Friendly brown bear standing upright, waving paw, smiling. Orange and pink sky visible through trees."
 
-Provide ONLY the image prompt, no preamble or explanation."""
+Provide ONLY the image prompt, no preamble or explanation. Then, on a new last line, write
+"ON-SCREEN TEXT:" followed by every piece of text visible in the frame (captions, titles,
+labels, stickers), copied exactly and separated by " / ", or "none" if there is no text."""
 
     return _claude_text(
         client,
@@ -805,6 +824,20 @@ def sample_shots(shots: list[Shot], max_frames: Optional[int]) -> list[Shot]:
         return list(shots)
     step = len(shots) / max_frames
     return [shots[int(i * step)] for i in range(max_frames)]
+
+
+_ON_SCREEN_RE = re.compile(r"\n?\s*\**on[- ]screen text\s*:?\s*\**\s*:?\s*(.*)\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def split_on_screen_text(answer: str) -> tuple[str, str]:
+    """Split Claude's frame answer into (visual description, on-screen text)."""
+    m = _ON_SCREEN_RE.search(answer or "")
+    if not m:
+        return (answer or "").strip(), ""
+    text = " ".join(m.group(1).split()).strip()
+    if text.lower().rstrip(".") in ("none", "no text", "n/a", ""):
+        text = ""
+    return answer[: m.start()].strip(), text
 
 
 def analyze_all_frames(
@@ -844,7 +877,7 @@ def analyze_all_frames(
     errors = []
     with ThreadPoolExecutor(max_workers=_frame_workers()) as pool:
         for shot, (desc, err) in zip(todo, pool.map(one, todo)):
-            shot.visual_description = desc
+            shot.visual_description, shot.on_screen_text = split_on_screen_text(desc)
             if err is not None:
                 errors.append(err)
     if todo and len(errors) == len(todo):
@@ -909,7 +942,10 @@ def analyze_video_content(
     full_transcript = " ".join([seg.text for seg in transcript])
 
     # Combine visual descriptions
-    visual_summary = " | ".join([shot.visual_description for shot in shots if shot.visual_description])
+    visual_summary = " | ".join([
+        shot.visual_description + (f" [on screen: {shot.on_screen_text}]" if shot.on_screen_text else "")
+        for shot in shots if shot.visual_description
+    ])
 
     prompt = f"""Analyze this educational video content and provide structured metadata.
 
@@ -1846,7 +1882,8 @@ def generate_markdown_output(
     shots: list[Shot],
     metadata: VideoMetadata,
     frames_dir: str,
-    visual_style: Optional[dict] = None
+    visual_style: Optional[dict] = None,
+    pacing: Optional[dict] = None,
 ) -> str:
     """Generate markdown output with embedded frames and rich header."""
     # Build markdown
@@ -1884,6 +1921,8 @@ def generate_markdown_output(
             "",
         ])
 
+    lines.extend(pacing_markdown(pacing or {}))
+
     # Add key details if available
     if metadata.key_details:
         lines.extend([
@@ -1904,6 +1943,8 @@ def generate_markdown_output(
     for shot in shots:
         # Escape pipe characters in content
         visual = shot.visual_description.replace("|", "\\|")
+        if shot.on_screen_text:
+            visual += "<br>**On screen:** " + shot.on_screen_text.replace("|", "\\|")
         dialogue = shot.dialogue.replace("|", "\\|")
 
         # Create relative path to frame image
@@ -1924,7 +1965,8 @@ def generate_docx_output(
     shots: list[Shot],
     metadata: VideoMetadata,
     output_path: str,
-    visual_style: Optional[dict] = None
+    visual_style: Optional[dict] = None,
+    pacing: Optional[dict] = None,
 ) -> str:
     """Generate Word document (.docx) output with table and embedded frames."""
     # Lazy import to avoid import issues
@@ -2004,6 +2046,24 @@ def generate_docx_output(
 
         doc.add_paragraph()  # Spacer
 
+    # Pacing & Hook: reuse the Markdown lines, as a table plus the hook notes
+    if pacing:
+        doc.add_heading("Pacing & Hook", level=1)
+        md = pacing_markdown(pacing)
+        rows = [l for l in md if l.startswith("| **")]
+        p_table = doc.add_table(rows=len(rows), cols=2)
+        p_table.style = "Table Grid"
+        for i, line in enumerate(rows):
+            label, value = [c.strip() for c in line.strip("|").split("|", 1)]
+            p_table.rows[i].cells[0].text = label.strip("*")
+            p_table.rows[i].cells[1].text = value
+            for run in p_table.rows[i].cells[0].paragraphs[0].runs:
+                run.bold = True
+        for line in md:
+            if line and not line.startswith(("|", "#")):
+                doc.add_paragraph(line.replace("**", ""))
+        doc.add_paragraph()  # Spacer
+
     # Add key details if available
     if metadata.key_details:
         doc.add_heading("Key Details", level=2)
@@ -2056,6 +2116,10 @@ def generate_docx_output(
             row_cells[2].text = "[no frame]"
 
         row_cells[3].text = shot.visual_description
+        if shot.on_screen_text:
+            p = row_cells[3].add_paragraph()
+            p.add_run("On screen: ").bold = True
+            p.add_run(shot.on_screen_text)
         row_cells[4].text = shot.dialogue
 
     # Set column widths
@@ -2075,6 +2139,112 @@ def generate_docx_output(
 # Main Processing Pipeline
 # =============================================================================
 
+
+# =============================================================================
+# Pacing and hook stats (from shot timings and the transcript; no API calls)
+# =============================================================================
+
+HOOK_SECONDS = 3.0
+
+
+def _pace_label(avg_shot: float) -> str:
+    if avg_shot < 1.5:
+        return "Very fast (social-native rapid cutting)"
+    if avg_shot < 3.0:
+        return "Fast"
+    if avg_shot < 6.0:
+        return "Moderate"
+    if avg_shot < 12.0:
+        return "Slow"
+    return "Very slow (long holds)"
+
+
+def pacing_stats(shots: list[Shot], transcript: list[TranscriptSegment], duration: float) -> dict:
+    """Editing rhythm and opening-hook numbers for a video."""
+    if not shots or duration <= 0:
+        return {}
+    lengths = sorted(max(0.0, sh.end_time - sh.start_time) for sh in shots)
+    n = len(lengths)
+    avg = duration / n
+    median = lengths[n // 2] if n % 2 else (lengths[n // 2 - 1] + lengths[n // 2]) / 2
+
+    # Cuts per 10-second window, start to end: the shape of the edit
+    windows = [0] * max(1, int(-(-duration // 10)))
+    for sh in shots[1:]:
+        windows[min(int(sh.start_time // 10), len(windows) - 1)] += 1
+
+    # Speech
+    words = sum(len(seg.text.split()) for seg in transcript)
+    speech_secs = sum(max(0.0, seg.end_time - seg.start_time) for seg in transcript)
+
+    # The hook: the first few seconds
+    hook_end = min(HOOK_SECONDS, duration)
+    hook_shots = [sh for sh in shots if sh.start_time < hook_end]
+    hook_words = []
+    for seg in transcript:
+        if seg.start_time < hook_end:
+            hook_words.extend(seg.text.split())
+    first_line = next((seg for seg in transcript if seg.text.strip()), None)
+    hook_text = " / ".join(sh.on_screen_text for sh in hook_shots if sh.on_screen_text)
+    opening = next((sh.visual_description for sh in hook_shots if sh.visual_description), "")
+
+    return {
+        "shots": n,
+        "cuts_per_minute": round((n - 1) / duration * 60, 1),
+        "average_shot_seconds": round(avg, 2),
+        "median_shot_seconds": round(median, 2),
+        "shortest_shot_seconds": round(lengths[0], 2),
+        "longest_shot_seconds": round(lengths[-1], 2),
+        "first_cut_at_seconds": round(shots[0].end_time, 2) if n > 1 else None,
+        "pace": _pace_label(avg),
+        "cuts_per_10s_window": windows,
+        "words_per_minute": round(words / speech_secs * 60) if speech_secs >= 2 else None,
+        "speech_share_of_runtime": round(min(1.0, speech_secs / duration), 2),
+        "hook": {
+            "seconds": round(hook_end, 1),
+            "shots": len(hook_shots),
+            "words_spoken": len(hook_words),
+            "first_spoken_line": first_line.text.strip() if first_line else None,
+            "first_words_at_seconds": round(first_line.start_time, 1) if first_line else None,
+            "on_screen_text": hook_text or None,
+            "opening_frame": opening[:300] or None,
+        },
+    }
+
+
+def pacing_markdown(p: dict) -> list[str]:
+    """Markdown lines for the Pacing & Hook section."""
+    if not p:
+        return []
+    h = p["hook"]
+    first_cut = f"{p['first_cut_at_seconds']}s" if p["first_cut_at_seconds"] is not None else "no cuts"
+    wpm = f"{p['words_per_minute']} wpm" if p["words_per_minute"] else "little or no speech"
+    spark = " ".join(str(c) for c in p["cuts_per_10s_window"])
+    lines = [
+        "## Pacing & Hook",
+        "",
+        "| Measure | Value |",
+        "|---------|-------|",
+        f"| **Pace** | {p['pace']} |",
+        f"| **Cuts per minute** | {p['cuts_per_minute']} |",
+        f"| **Shot length** | avg {p['average_shot_seconds']}s · median {p['median_shot_seconds']}s · "
+        f"{p['shortest_shot_seconds']}s to {p['longest_shot_seconds']}s |",
+        f"| **First cut** | {first_cut} |",
+        f"| **Cuts per 10s, start to end** | {spark} |",
+        f"| **Speech** | {wpm}, talking {int(p['speech_share_of_runtime'] * 100)}% of the runtime |",
+        "",
+        f"**The hook (first {h['seconds']}s):** {h['shots']} shot(s), {h['words_spoken']} word(s) spoken.",
+    ]
+    if h["first_spoken_line"]:
+        lines.append(f"First words at {h['first_words_at_seconds']}s: \u201c{h['first_spoken_line']}\u201d")
+    if h["on_screen_text"]:
+        lines.append(f"On screen: {h['on_screen_text']}")
+    if h["opening_frame"]:
+        lines.append(f"Opening frame: {h['opening_frame']}")
+    lines.append("")
+    return lines
+
+
 @dataclass
 class PipelineResult:
     shots: list
@@ -2082,6 +2252,7 @@ class PipelineResult:
     visual_style: dict
     transcript: list
     frames_analyzed: int
+    pacing: dict = None
 
 
 def analyze_video_file(
@@ -2223,7 +2394,8 @@ def analyze_video_file(
     )
 
     frames_analyzed = sum(1 for sh in shots if sh.visual_description)
-    return PipelineResult(shots, metadata, visual_style, transcript, frames_analyzed)
+    pacing = pacing_stats(shots, transcript, duration)
+    return PipelineResult(shots, metadata, visual_style, transcript, frames_analyzed, pacing)
 
 
 def process_video(
@@ -2284,6 +2456,7 @@ def process_video(
             interval=interval, max_duration=max_duration, verbose=verbose,
         )
         shots, metadata, visual_style = result.shots, result.metadata, result.visual_style
+        pacing = result.pacing
 
         # Step 7: Generate output
         if verbose:
@@ -2296,13 +2469,13 @@ def process_video(
             # Create both generic and titled versions
             generic_path = storyboard_dir / "breakdown.docx"
             titled_path = storyboard_dir / f"{safe_title}_breakdown.docx"
-            generate_docx_output(shots, metadata, str(generic_path), visual_style)
-            generate_docx_output(shots, metadata, str(titled_path), visual_style)
+            generate_docx_output(shots, metadata, str(generic_path), visual_style, pacing)
+            generate_docx_output(shots, metadata, str(titled_path), visual_style, pacing)
             output_path = titled_path
         else:
             generic_path = storyboard_dir / "breakdown.md"
             titled_path = storyboard_dir / f"{safe_title}_breakdown.md"
-            markdown = generate_markdown_output(shots, metadata, str(frames_dir), visual_style)
+            markdown = generate_markdown_output(shots, metadata, str(frames_dir), visual_style, pacing)
             with open(generic_path, "w") as f:
                 f.write(markdown)
             with open(titled_path, "w") as f:
@@ -2384,7 +2557,7 @@ Environment:
         for dep in missing:
             print(f"  - {dep}")
         print("\nInstall with:")
-        print("  pip install openai-whisper scenedetect[opencv] anthropic Pillow")
+        print("  pip install faster-whisper scenedetect[opencv] anthropic Pillow")
         print("  brew install ffmpeg yt-dlp  # or apt-get install on Linux")
         sys.exit(1)
 

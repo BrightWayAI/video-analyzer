@@ -444,3 +444,41 @@ def test_oxylabs_proxy_gets_sticky_session():
     assert av._sticky_proxy(already) == already
     other = "http://u:p@geo.iproyal.com:12321"
     assert av._sticky_proxy(other) == other
+
+
+def test_on_screen_text_split_from_description():
+    desc, text = av.split_on_screen_text(
+        'Live-action footage. Woman at desk.\nON-SCREEN TEXT: "POV: you just got paid" / @money.tips')
+    assert desc == "Live-action footage. Woman at desk."
+    assert text == '"POV: you just got paid" / @money.tips'
+    assert av.split_on_screen_text("3D render. Meadow.\nON-SCREEN TEXT: none") == ("3D render. Meadow.", "")
+    assert av.split_on_screen_text("Flat 2D.\n**On-screen text:** 40% of Americans")[1] == "40% of Americans"
+    assert av.split_on_screen_text("No marker.") == ("No marker.", "")
+
+
+def test_pacing_and_hook_stats():
+    spans = [(0, 0.8), (0.8, 1.5), (1.5, 4), (4, 9), (9, 10.5)]
+    shots = [av.Shot(number=i + 1, start_time=a, end_time=b, visual_description="Live-action footage. Dog.",
+                     on_screen_text="POV: my dog" if i == 0 else "") for i, (a, b) in enumerate(spans)]
+    transcript = [av.TranscriptSegment(start_time=0.4, end_time=3.0, text="Mostly my kids fell in love with my nose"),
+                  av.TranscriptSegment(start_time=6, end_time=9, text="and that is the story")]
+    p = av.pacing_stats(shots, transcript, 10.5)
+    assert p["cuts_per_minute"] == 22.9 and p["first_cut_at_seconds"] == 0.8
+    assert p["cuts_per_10s_window"] == [4, 0] and p["pace"] == "Fast"
+    assert p["hook"]["shots"] == 3 and p["hook"]["words_spoken"] == 9
+    assert p["hook"]["on_screen_text"] == "POV: my dog"
+    md = "\n".join(av.pacing_markdown(p))
+    assert "## Pacing & Hook" in md and "22.9" in md and "Mostly my kids" in md
+    assert av.pacing_stats([], [], 10) == {}
+
+
+def test_docx_includes_pacing_and_on_screen_text(tmp_path):
+    from docx import Document
+
+    shots = [av.Shot(number=1, start_time=0, end_time=2, visual_description="Text card.", on_screen_text='"ONE BIG RABBIT"')]
+    meta = av.VideoMetadata(title="t", duration=2.0, width=640, height=360, orientation="horizontal",
+                            word_count=0, image_count=1)
+    out = tmp_path / "s.docx"
+    av.generate_docx_output(shots, meta, str(out), None, av.pacing_stats(shots, [], 2.0))
+    text = "\n".join(c.text for t in Document(str(out)).tables for r in t.rows for c in r.cells)
+    assert "Cuts per minute" in text and "ONE BIG RABBIT" in text

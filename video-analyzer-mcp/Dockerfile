@@ -16,8 +16,9 @@ RUN pip install --no-cache-dir . sentry-sdk \
  && pip install --no-cache-dir --upgrade "yt-dlp[default]"
 
 # Bake the Whisper models the hosted server allows, so the first call isn't a download.
-ENV XDG_CACHE_HOME=/opt/cache
-RUN python -c "import whisper; whisper.load_model('base'); whisper.load_model('small')"
+ENV XDG_CACHE_HOME=/opt/cache HF_HOME=/opt/cache/huggingface
+RUN python -c "from faster_whisper import WhisperModel as M; M('base', device='cpu', compute_type='int8'); M('small', device='cpu', compute_type='int8')" \
+ && chmod -R a+rX /opt/cache
 
 RUN useradd --create-home app
 USER app

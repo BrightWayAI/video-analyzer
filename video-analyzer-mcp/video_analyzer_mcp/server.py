@@ -187,6 +187,7 @@ def _shots_to_dicts(shots: list[av.Shot]) -> list[dict]:
             "end_time": s.end_time,
             "frame_path": s.frame_path,
             "visual_description": s.visual_description,
+            "on_screen_text": s.on_screen_text,
             "dialogue": s.dialogue,
         }
         for s in shots
@@ -372,8 +373,8 @@ async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
 
         await progress.report(0.95, "Writing storyboard")
         shots, meta, style = result.shots, result.metadata, result.visual_style
-        markdown = await _run(av.generate_markdown_output, shots, meta, str(bundle.path / "frames"), style)
-        await _run(av.generate_docx_output, shots, meta, str(bundle.path / "storyboard.docx"), style)
+        markdown = await _run(av.generate_markdown_output, shots, meta, str(bundle.path / "frames"), style, result.pacing)
+        await _run(av.generate_docx_output, shots, meta, str(bundle.path / "storyboard.docx"), style, result.pacing)
         sheet = await _run(av.make_contact_sheet, shots, str(bundle.path / "contact_sheet.jpg"))
         await _run(bundle.zip_dir, "frames", "frames.zip")
         log.step("outputs")
@@ -389,6 +390,7 @@ async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
         "reading_level": meta.reading_level,
         "story_structure": meta.story_structure,
         "fingerprint": {k: v for k, v in style.items() if not k.startswith("legacy_")},
+        "pacing": result.pacing,
     }
     if base:
         summary["files"] = {
@@ -455,6 +457,7 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context):
         "dimensions": f"{width}x{height}",
         "orientation": orientation,
         "shots_extracted": len(shots),
+        "pacing": av.pacing_stats(shots, [], duration),
         "frames_directory": frames_dir,
         "shots": _shots_to_dicts(shots),
     }, indent=2)
@@ -496,6 +499,7 @@ async def _extract_hosted(params: ExtractFramesInput, progress: "_Progress"):
         "dimensions": f"{width}x{height}",
         "orientation": orientation,
         "shots_extracted": len(shots),
+        "pacing": av.pacing_stats(shots, [], duration),
         "shots": shot_dicts,
     }
     if base:
@@ -632,6 +636,7 @@ async def _fingerprint(params: FingerprintInput, progress: "_Progress"):
         "reading_level": meta.reading_level,
         "story_structure": meta.story_structure,
         "fingerprint": {k: v for k, v in result.visual_style.items() if not k.startswith("legacy_")},
+        "pacing": result.pacing,
     }, indent=2)
 
 
@@ -651,7 +656,7 @@ async def video_check_deps() -> str:
 
     install_hints = {
         "ffmpeg (system package)": "brew install ffmpeg (macOS) | apt-get install ffmpeg (Linux)",
-        "openai-whisper": "pip install openai-whisper",
+        "faster-whisper": "pip install faster-whisper",
         "scenedetect[opencv]": "pip install scenedetect[opencv]",
         "anthropic": "pip install anthropic",
         "Pillow": "pip install Pillow",
@@ -706,7 +711,7 @@ def _error_suggestion(e: Exception) -> str:
     if "limit is" in msg:
         return "Trim the video or send a shorter clip."
     if "whisper" in msg:
-        return "OpenAI Whisper is not installed. Run: pip install openai-whisper"
+        return "Whisper is not installed. Run: pip install faster-whisper"
     if "no such file" in msg or "not found" in msg:
         return "The specified file was not found. Check the path and try again."
     return "Check the error message above and try again."

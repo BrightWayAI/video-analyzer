@@ -189,30 +189,161 @@ async def healthz(request):
 
 
 # ---------------------------------------------------------------------------
-# Result cache: a retry of the same call (e.g. after a dropped connection)
-# returns the finished result instead of paying for the analysis twice.
+# Background jobs. The mcprush gateway gives a call 44 seconds end to end, and
+# a video takes minutes. So a call starts the work as a background job keyed
+# by (tool, arguments) and waits up to wait_seconds(); if it isn't done, it
+# answers isError "still working, call again with the same arguments". mcprush
+# doesn't count isError answers, nor a repeat of a counted call within 15
+# minutes, so the buyer pays for one call. A finished job's result is kept
+# (VIDEO_ANALYZER_CACHE_HOURS) so a repeat returns it instead of paying twice.
 # ---------------------------------------------------------------------------
 
-_cache: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
-_CACHE_MAX = 200
+def wait_seconds() -> float:
+    return float(os.environ.get("VIDEO_ANALYZER_WAIT_SECONDS", "35"))
 
 
 def _cache_ttl() -> float:
     return float(os.environ.get("VIDEO_ANALYZER_CACHE_HOURS", "24")) * 3600
 
 
-async def cached_call(tool: str, params, compute):
-    key = hashlib.sha256(f"{tool}:{params.model_dump_json()}".encode()).hexdigest()
-    hit = _cache.get(key)
-    if hit and time.time() - hit[0] < min(_cache_ttl(), file_ttl_hours() * 3600):
-        _cache.move_to_end(key)
-        log.info("cache hit tool=%s", tool)
-        return hit[1]
-    result = await compute()
-    _cache[key] = (time.time(), result)
-    while len(_cache) > _CACHE_MAX:
-        _cache.popitem(last=False)
-    return result
+def _max_jobs() -> int:
+    return int(os.environ.get("VIDEO_ANALYZER_MAX_JOBS", "12"))
+
+
+class Job:
+    def __init__(self, tool: str):
+        self.tool = tool
+        self.started = time.time()
+        self.finished: float | None = None
+        self.frac = 0.0
+        self.msg = "Queued"
+        self.task: asyncio.Task | None = None
+
+    def update(self, frac: float, msg: str) -> None:
+        self.frac, self.msg = frac, msg
+
+    @property
+    def done(self) -> bool:
+        return self.task is not None and self.task.done()
+
+
+_jobs: "OrderedDict[str, Job]" = OrderedDict()
+
+
+def _job_key(tool: str, params) -> str:
+    return hashlib.sha256(f"{tool}:{params.model_dump_json()}".encode()).hexdigest()
+
+
+def _prune_jobs() -> None:
+    ttl = min(_cache_ttl(), file_ttl_hours() * 3600)
+    for key, job in list(_jobs.items()):
+        if job.finished and time.time() - job.finished > ttl:
+            del _jobs[key]
+    finished = [k for k, j in _jobs.items() if j.finished]
+    while len(_jobs) > 200 and finished:
+        del _jobs[finished.pop(0)]
+
+
+async def _run_to_end(job: Job, compute) -> object:
+    try:
+        return await compute(job)
+    finally:
+        job.finished = time.time()
+
+
+def _pending_result(job: Job):
+    from mcp.types import CallToolResult, TextContent
+
+    elapsed = int(time.time() - job.started)
+    pct = f", about {int(job.frac * 100)}% done" if job.frac > 0 else ""
+    text = (
+        f"STILL WORKING, not a failure. {job.msg}{pct}, {elapsed // 60}m{elapsed % 60:02d}s so far. "
+        f"Call {job.tool} again with exactly the same arguments in about 30 seconds to get the "
+        "result. Calls made while it is still running are not counted against your plan."
+    )
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
+async def run_job(tool: str, params, compute):
+    """Start or join the job for (tool, params); return its result or a
+    'still working' isError answer after waiting at most wait_seconds()."""
+    _prune_jobs()
+    key = _job_key(tool, params)
+    job = _jobs.get(key)
+    if job is None:
+        if sum(1 for j in _jobs.values() if not j.done) >= _max_jobs():
+            raise RuntimeError("The server is busy with other videos. Try again in a few minutes.")
+        job = Job(tool)
+        job.task = asyncio.create_task(_run_to_end(job, compute))
+        _jobs[key] = job
+        log.info("job start tool=%s key=%s", tool, key[:8])
+    else:
+        log.info("job join tool=%s key=%s done=%s", tool, key[:8], job.done)
+
+    if not job.done:
+        await asyncio.wait({job.task}, timeout=wait_seconds())
+    if not job.done:
+        return _pending_result(job)
+    if job.task.exception() is not None:
+        _jobs.pop(key, None)  # a failed job is reported once; a retry starts over
+        raise job.task.exception()
+    return job.task.result()
+
+
+# ---------------------------------------------------------------------------
+# Response size: mcprush refuses answers over 256 KiB (the buyer gets a 500).
+# ---------------------------------------------------------------------------
+
+MAX_RESPONSE_BYTES = 230_000
+
+
+def fit_response(texts: list[str], image: bytes | None = None, docs_hint: str = ""):
+    """Build a CallToolResult under MAX_RESPONSE_BYTES: drop the image first,
+    then shorten the last text block, pointing at the full files."""
+    import base64
+
+    from mcp.types import CallToolResult, ImageContent, TextContent
+
+    def build(texts, image):
+        content = [TextContent(type="text", text=t) for t in texts]
+        if image:
+            content.append(ImageContent(type="image", data=base64.b64encode(image).decode(),
+                                        mimeType="image/jpeg"))
+        return CallToolResult(content=content, isError=False)
+
+    def size(result) -> int:
+        return len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
+
+    result = build(texts, image)
+    if size(result) <= MAX_RESPONSE_BYTES:
+        return result
+    result = build(texts, None)
+    over = size(result) - MAX_RESPONSE_BYTES
+    if over <= 0:
+        return result
+    texts = list(texts)
+    note = f"\n\n[Cut to fit the response size limit.{' ' + docs_hint if docs_hint else ''}]"
+    keep = max(0, len(texts[-1]) - over - len(note) - 2000)
+    texts[-1] = texts[-1][:keep] + note
+    return build(texts, None)
+
+
+def shrink_jpeg(path: str, max_width: int = 1100, max_bytes: int = 90_000) -> bytes | None:
+    """A smaller copy of a JPEG for inline display, or None if it can't fit."""
+    import io
+
+    from PIL import Image as PILImage
+
+    img = PILImage.open(path).convert("RGB")
+    if img.width > max_width:
+        img = img.resize((max_width, int(img.height * max_width / img.width)))
+    for quality in (75, 60, 45):
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality, optimize=True)
+        if buf.tell() <= max_bytes:
+            return buf.getvalue()
+        img = img.resize((int(img.width * 0.8), int(img.height * 0.8)))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +443,9 @@ def build_app():
     # would answer 421, so turn it off; the token check is the gate.
     mcp.settings.transport_security = None
     mcp.settings.stateless_http = True
+    # mcprush wants one answer per call, then the response closed: plain JSON
+    # instead of an SSE stream.
+    mcp.settings.json_response = True
 
     # Public routes (no token): health check, and job files behind random ids.
     mcp.custom_route("/healthz", methods=["GET"])(healthz)

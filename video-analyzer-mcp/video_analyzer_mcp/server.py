@@ -227,14 +227,19 @@ class _Progress:
     long steps keep the connection active and the caller sees it's alive.
     """
 
-    def __init__(self, ctx: Context, interval: float = 15.0):
-        self.ctx = ctx
+    def __init__(self, ctx: Optional[Context], interval: float = 15.0, job=None):
+        self.ctx = ctx      # None for a hosted background job: no request to report to
+        self.job = job      # hosted.Job whose status 'still working' answers show
         self.interval = interval
         self.frac = 0.0
         self.msg = "Starting"
 
     async def report(self, frac: float, msg: str):
         self.frac, self.msg = frac, msg
+        if self.job is not None:
+            self.job.update(frac, msg)
+        if self.ctx is None:
+            return
         try:
             await self.ctx.report_progress(frac, 1.0, msg)
         except Exception:  # a client that went away mustn't kill the job
@@ -249,6 +254,8 @@ class _Progress:
     async def _beat(self):
         while True:
             await anyio.sleep(self.interval)
+            if self.ctx is None:
+                continue
             try:
                 await self.ctx.report_progress(self.frac, 1.0, f"{self.msg} (still working)")
             except Exception:
@@ -311,7 +318,7 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context):
     """
     hosted.check_hosted_inputs(params.input_path, params.cookies_file)
     if hosted.is_hosted():
-        return await hosted.cached_call("video_analyze", params, lambda: _analyze_hosted(params, ctx))
+        return await hosted.run_job("video_analyze", params, lambda job: _analyze_hosted(params, _Progress(None, job=job)))
 
     _check_deps()
     progress = _Progress(ctx)
@@ -340,12 +347,9 @@ async def video_analyze(params: AnalyzeVideoInput, ctx: Context):
     }, indent=2)
 
 
-async def _analyze_hosted(params: AnalyzeVideoInput, ctx: Context):
+async def _analyze_hosted(params: AnalyzeVideoInput, progress: "_Progress"):
     """Hosted pipeline: results inline, files behind expiring private links."""
-    from mcp.server.fastmcp import Image
-
     _check_deps()
-    progress = _Progress(ctx)
     async with hosted.job_slot(), hosted.job_log("video_analyze", params.input_path) as log:
         await progress.report(0.02, "Downloading video")
         bundle = hosted.new_bundle()
@@ -393,10 +397,12 @@ async def _analyze_hosted(params: AnalyzeVideoInput, ctx: Context):
             "frames_zip": f"{base}/frames.zip",
             "links_expire_after_hours": hosted.file_ttl_hours(),
         }
-    content = [json.dumps(summary, indent=2), _frames_url_rewrite(markdown, base)]
-    if sheet:
-        content.append(Image(data=Path(sheet).read_bytes(), format="jpeg"))
-    return content
+    inline_sheet = await _run(hosted.shrink_jpeg, sheet) if sheet else None
+    return hosted.fit_response(
+        [json.dumps(summary, indent=2), _frames_url_rewrite(markdown, base)],
+        inline_sheet,
+        docs_hint="The full storyboard is in the storyboard_docx link above." if base else "",
+    )
 
 
 @mcp.tool(
@@ -423,7 +429,7 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context):
 
     hosted.check_hosted_inputs(params.input_path, params.cookies_file, params.output_dir)
     if hosted.is_hosted():
-        return await hosted.cached_call("video_extract_frames", params, lambda: _extract_hosted(params, ctx))
+        return await hosted.run_job("video_extract_frames", params, lambda job: _extract_hosted(params, _Progress(None, job=job)))
 
     _check_deps()
     progress = _Progress(ctx)
@@ -454,11 +460,8 @@ async def video_extract_frames(params: ExtractFramesInput, ctx: Context):
     }, indent=2)
 
 
-async def _extract_hosted(params: ExtractFramesInput, ctx: Context):
-    from mcp.server.fastmcp import Image
-
+async def _extract_hosted(params: ExtractFramesInput, progress: "_Progress"):
     _check_deps()
-    progress = _Progress(ctx)
     async with hosted.job_slot(), hosted.job_log("video_extract_frames", params.input_path) as log:
         await progress.report(0.05, "Downloading video")
         bundle = hosted.new_bundle()
@@ -501,14 +504,13 @@ async def _extract_hosted(params: ExtractFramesInput, ctx: Context):
             "frames_zip": f"{base}/frames.zip",
             "links_expire_after_hours": hosted.file_ttl_hours(),
         }
-    content = [json.dumps(summary, indent=2)]
-    if sheet:
-        content.append(Image(data=Path(sheet).read_bytes(), format="jpeg"))
-    return content
+    inline_sheet = await _run(hosted.shrink_jpeg, sheet) if sheet else None
+    return hosted.fit_response([json.dumps(summary, indent=2)], inline_sheet)
 
 
 @mcp.tool(
     name="video_transcribe",
+    structured_output=False,
     annotations={
         "title": "Transcribe Video Audio",
         "readOnlyHint": True,
@@ -517,7 +519,7 @@ async def _extract_hosted(params: ExtractFramesInput, ctx: Context):
         "openWorldHint": True,
     },
 )
-async def video_transcribe(params: TranscribeInput, ctx: Context) -> str:
+async def video_transcribe(params: TranscribeInput, ctx: Context):
     """Transcribe the audio track of a video using OpenAI Whisper (runs locally,
     no OpenAI key needed).
 
@@ -529,13 +531,12 @@ async def video_transcribe(params: TranscribeInput, ctx: Context) -> str:
     if hosted.is_hosted() and params.model_size.value not in hosted.HOSTED_WHISPER_MODELS:
         raise ValueError("The hosted server supports Whisper 'base' and 'small' only.")
     if hosted.is_hosted():
-        return await hosted.cached_call("video_transcribe", params, lambda: _transcribe(params, ctx))
-    return await _transcribe(params, ctx)
+        return await hosted.run_job("video_transcribe", params, lambda job: _transcribe(params, _Progress(None, job=job)))
+    return await _transcribe(params, _Progress(ctx))
 
 
-async def _transcribe(params: TranscribeInput, ctx: Context) -> str:
+async def _transcribe(params: TranscribeInput, progress: "_Progress"):
     _check_deps()
-    progress = _Progress(ctx)
     async with hosted.job_slot(), hosted.job_log("video_transcribe", params.input_path) as log:
         await progress.report(0.1, "Downloading video")
         try:
@@ -568,6 +569,7 @@ async def _transcribe(params: TranscribeInput, ctx: Context) -> str:
 
 @mcp.tool(
     name="video_fingerprint",
+    structured_output=False,
     annotations={
         "title": "Stylistic Fingerprint Analysis",
         "readOnlyHint": True,
@@ -576,7 +578,7 @@ async def _transcribe(params: TranscribeInput, ctx: Context) -> str:
         "openWorldHint": True,
     },
 )
-async def video_fingerprint(params: FingerprintInput, ctx: Context) -> str:
+async def video_fingerprint(params: FingerprintInput, ctx: Context):
     """Generate a Stylistic Fingerprint (v3) for a video.
 
     Performs frame extraction, transcription, and visual analysis, then runs
@@ -593,13 +595,12 @@ async def video_fingerprint(params: FingerprintInput, ctx: Context) -> str:
     """
     hosted.check_hosted_inputs(params.input_path, params.cookies_file)
     if hosted.is_hosted():
-        return await hosted.cached_call("video_fingerprint", params, lambda: _fingerprint(params, ctx))
-    return await _fingerprint(params, ctx)
+        return await hosted.run_job("video_fingerprint", params, lambda job: _fingerprint(params, _Progress(None, job=job)))
+    return await _fingerprint(params, _Progress(ctx))
 
 
-async def _fingerprint(params: FingerprintInput, ctx: Context) -> str:
+async def _fingerprint(params: FingerprintInput, progress: "_Progress"):
     _check_deps()
-    progress = _Progress(ctx)
     async with hosted.job_slot(), hosted.job_log("video_fingerprint", params.input_path) as log:
         await progress.report(0.05, "Downloading video")
         try:

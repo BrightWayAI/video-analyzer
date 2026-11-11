@@ -111,24 +111,143 @@ def test_bundle_rejects_bad_ids_and_traversal(client):
     assert hosted.resolve_bundle_file(b.id, "a.txt") is not None
 
 
-# --- cache --------------------------------------------------------------------
+# --- background jobs --------------------------------------------------------
 
-def test_cached_call_reuses_result():
+def _params(url="https://e.com/v"):
+    return SimpleNamespace(model_dump_json=lambda: '{"input_path":"%s"}' % url)
+
+
+def test_job_result_is_reused_without_recomputing(monkeypatch):
+    hosted._jobs.clear()
     calls = []
 
-    async def compute():
+    async def compute(job):
         calls.append(1)
-        return ["result"]
-
-    params = SimpleNamespace(model_dump_json=lambda: '{"input_path":"https://e.com/v"}')
+        return "result"
 
     async def go():
-        a = await hosted.cached_call("t", params, compute)
-        b = await hosted.cached_call("t", params, compute)
-        return a, b
+        return (await hosted.run_job("t", _params(), compute),
+                await hosted.run_job("t", _params(), compute))
 
-    a, b = asyncio.run(go())
-    assert a == b == ["result"] and len(calls) == 1
+    assert asyncio.run(go()) == ("result", "result") and len(calls) == 1
+
+
+def test_slow_job_answers_still_working_then_result(monkeypatch):
+    hosted._jobs.clear()
+    monkeypatch.setenv("VIDEO_ANALYZER_WAIT_SECONDS", "0.05")
+
+    async def compute(job):
+        job.update(0.5, "Analyzing frames with Claude")
+        await asyncio.sleep(0.2)
+        return "done"
+
+    async def go():
+        first = await hosted.run_job("video_analyze", _params(), compute)
+        await asyncio.sleep(0.3)
+        second = await hosted.run_job("video_analyze", _params(), compute)
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert first.isError and "STILL WORKING" in first.content[0].text
+    assert "Analyzing frames with Claude, about 50% done" in first.content[0].text
+    assert "video_analyze again with exactly the same arguments" in first.content[0].text
+    assert second == "done"
+
+
+def test_failed_job_reported_once_then_retried(monkeypatch):
+    hosted._jobs.clear()
+    attempts = []
+
+    async def compute(job):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("Download failed: boom")
+        return "ok"
+
+    async def go():
+        with pytest.raises(RuntimeError, match="boom"):
+            await hosted.run_job("t", _params(), compute)
+        return await hosted.run_job("t", _params(), compute)
+
+    assert asyncio.run(go()) == "ok" and len(attempts) == 2
+
+
+def test_too_many_running_jobs_refused(monkeypatch):
+    hosted._jobs.clear()
+    monkeypatch.setenv("VIDEO_ANALYZER_WAIT_SECONDS", "0.01")
+    monkeypatch.setenv("VIDEO_ANALYZER_MAX_JOBS", "1")
+
+    async def compute(job):
+        await asyncio.sleep(1)
+
+    async def go():
+        await hosted.run_job("t", _params("https://e.com/a"), compute)
+        with pytest.raises(RuntimeError, match="busy"):
+            await hosted.run_job("t", _params("https://e.com/b"), compute)
+        for j in hosted._jobs.values():
+            j.task.cancel()
+
+    asyncio.run(go())
+
+
+def test_tool_call_through_app_returns_json_still_working(client, monkeypatch):
+    """End to end: a slow tool answers isError 'still working' as plain JSON
+    within the wait, and the repeat call returns the finished result."""
+    from video_analyzer_mcp import server
+
+    hosted._jobs.clear()
+    monkeypatch.setenv("VIDEO_ANALYZER_WAIT_SECONDS", "0.2")
+    monkeypatch.setattr(hosted, "validate_remote_url", lambda url: None)
+
+    async def slow_transcribe(params, progress):
+        await progress.report(0.3, "Transcribing audio")
+        await asyncio.sleep(0.6)
+        return '{"status": "success"}'
+
+    monkeypatch.setattr(server, "_transcribe", slow_transcribe)
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "video_transcribe",
+                       "arguments": {"params": {"input_path": "https://e.com/v.mp4"}}}}
+    headers = {**MCP_HEADERS, "x-mcprush-token": os.environ["MCPRUSH_TOKEN"]}
+
+    t0 = time.time()
+    r = client.post("/mcp", json=call, headers=headers)
+    assert time.time() - t0 < 0.6
+    assert r.headers["content-type"].startswith("application/json")
+    result = r.json()["result"]
+    assert result["isError"] is True and "STILL WORKING" in result["content"][0]["text"]
+
+    time.sleep(0.6)
+    result = client.post("/mcp", json=call, headers=headers).json()["result"]
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == '{"status": "success"}'
+
+
+# --- response size ----------------------------------------------------------
+
+def test_fit_response_drops_image_then_truncates():
+    small = hosted.fit_response(["summary", "storyboard"], b"\xff" * 1000)
+    assert [c.type for c in small.content] == ["text", "text", "image"]
+
+    no_image = hosted.fit_response(["summary", "x" * 100_000], b"\xff" * 120_000)
+    assert [c.type for c in no_image.content] == ["text", "text"]
+
+    cut = hosted.fit_response(["summary", "y" * 400_000], None, docs_hint="See the docx.")
+    assert len(cut.model_dump_json().encode()) <= hosted.MAX_RESPONSE_BYTES
+    assert cut.content[0].text == "summary" and "See the docx." in cut.content[1].text
+
+
+def test_shrink_jpeg_fits_budget(tmp_path):
+    from PIL import Image as PILImage
+    import random
+
+    path = tmp_path / "sheet.jpg"
+    img = PILImage.new("RGB", (1280, 2000))
+    img.putdata([(random.randrange(256), random.randrange(256), random.randrange(256))
+                 for _ in range(1280 * 2000)])
+    img.save(path, "JPEG", quality=90)
+    out = hosted.shrink_jpeg(str(path), max_bytes=90_000)
+    assert out is None or len(out) <= 90_000
 
 
 # --- pipeline helpers -------------------------------------------------------

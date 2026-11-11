@@ -95,9 +95,13 @@ docker run -p 8000:8000 \
 | `VIDEO_ANALYZER_MAX_FRAMES` | `60` | Most frames sent to Claude per video (an even sample) |
 | `VIDEO_ANALYZER_FRAME_WORKERS` | `6` | Frames analyzed in parallel |
 | `VIDEO_ANALYZER_FILE_TTL_HOURS` | `72` | How long storyboard, frame and zip links work |
-| `VIDEO_ANALYZER_CACHE_HOURS` | `24` | A repeated identical call returns the cached result |
+| `VIDEO_ANALYZER_CACHE_HOURS` | `24` | A repeated identical call returns the finished result |
+| `VIDEO_ANALYZER_WAIT_SECONDS` | `35` | How long a call waits for its job before answering "still working" (mcprush allows 44s per call) |
+| `VIDEO_ANALYZER_MAX_JOBS` | `12` | Jobs in progress at once; more are refused as busy |
 | `YTDLP_PROXY` | | Residential proxy URL (`http://user:pass@host:port`). YouTube and Instagram always go through it; other sites only when blocked. Proxied downloads are capped at 480p to save proxy bandwidth |
 | `SENTRY_DSN` | | Send errors to Sentry |
+
+Long jobs: every hosted tool runs as a background job keyed by its arguments. A call waits up to `VIDEO_ANALYZER_WAIT_SECONDS`; if the job isn't finished it answers `isError` with "STILL WORKING … call again with exactly the same arguments". mcprush doesn't count `isError` answers, so the buyer pays for the one call that returns the result. Answers are plain JSON (no SSE stream) and kept under mcprush's 256 KiB cap: the inline contact sheet is shrunk, and dropped (then the storyboard shortened) if needed.
 
 Hosted results: `video_analyze` returns a JSON summary (with the fingerprint and file links), the storyboard as Markdown with working image links, and a contact-sheet image. `video_extract_frames` returns shots with `frame_url`s and a contact sheet. `/healthz` answers `ok` for health checks.
 

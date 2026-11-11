@@ -96,7 +96,7 @@ docker run -p 8000:8000 \
 | `VIDEO_ANALYZER_FRAME_WORKERS` | `6` | Frames analyzed in parallel |
 | `VIDEO_ANALYZER_FILE_TTL_HOURS` | `72` | How long storyboard, frame and zip links work |
 | `VIDEO_ANALYZER_CACHE_HOURS` | `24` | A repeated identical call returns the cached result |
-| `YTDLP_PROXY` | | Proxy for video downloads (helps when YouTube blocks the server) |
+| `YTDLP_PROXY` | | Residential proxy URL (`http://user:pass@host:port`). YouTube and Instagram always go through it; other sites only when blocked. Proxied downloads are capped at 480p to save proxy bandwidth |
 | `SENTRY_DSN` | | Send errors to Sentry |
 
 Hosted results: `video_analyze` returns a JSON summary (with the fingerprint and file links), the storyboard as Markdown with working image links, and a contact-sheet image. `video_extract_frames` returns shots with `frame_url`s and a contact sheet. `/healthz` answers `ok` for health checks.

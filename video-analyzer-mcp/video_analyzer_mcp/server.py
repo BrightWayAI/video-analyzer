@@ -697,8 +697,9 @@ def _error_suggestion(e: Exception) -> str:
         return "FFmpeg is not installed. Install it: brew install ffmpeg (macOS) or apt-get install ffmpeg (Linux)"
     if "anthropic_api_key" in msg or "api_key" in msg:
         return "Set the ANTHROPIC_API_KEY environment variable before running the server."
-    if "sign in to confirm" in msg or "not a bot" in msg:
-        return "YouTube blocked the download from this server. Try a direct link to the video file, or another host (Vimeo, Loom, Drive)."
+    if "download failed" in msg and av._looks_blocked(msg):
+        return ("The video site refused the download (bot check or login wall). Try again in a "
+                "minute; if it keeps happening, send a direct link to the video file.")
     if "download failed" in msg:
         return "Check that the URL is a public video. Private, age-restricted and members-only videos can't be downloaded."
     if "limit is" in msg:

@@ -262,3 +262,56 @@ def test_whisper_hallucinations_dropped():
     # Ordinary narration stays
     assert not av._likely_not_speech({"no_speech_prob": 0.02, "avg_logprob": -0.25, "compression_ratio": 1.5})
     assert not av._likely_not_speech({"no_speech_prob": 0.6, "avg_logprob": -0.3, "compression_ratio": 1.4})
+
+
+def _fake_ytdlp(monkeypatch, outcomes):
+    """outcomes: list of (returncode, stderr) for successive yt-dlp runs."""
+    calls = []
+
+    def run(cmd, capture_output=True, text=True):
+        rc, err = outcomes[len(calls)]
+        calls.append(cmd)
+        return SimpleNamespace(returncode=rc, stdout="My Title\n" if rc == 0 else "", stderr=err)
+
+    monkeypatch.setattr(av.subprocess, "run", run)
+    return calls
+
+
+def test_youtube_goes_straight_to_proxy(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTDLP_PROXY", "http://user:secret@proxy:8000")
+    calls = _fake_ytdlp(monkeypatch, [(0, "")])
+    (tmp_path / "video_download.mp4").write_bytes(b"x")
+    _, title = av.download_video("https://www.youtube.com/watch?v=abc", str(tmp_path))
+    assert title == "My Title"
+    assert len(calls) == 1 and "--proxy" in calls[0]
+    assert "res:480,ext:mp4:m4a" in calls[0]
+
+
+def test_other_sites_fall_back_to_proxy_only_when_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTDLP_PROXY", "http://user:secret@proxy:8000")
+    (tmp_path / "video_download.mp4").write_bytes(b"x")
+    calls = _fake_ytdlp(monkeypatch, [(1, "ERROR: [TikTok] x: HTTP Error 403: Forbidden"), (0, "")])
+    av.download_video("https://www.tiktok.com/@a/video/1", str(tmp_path))
+    assert "--proxy" not in calls[0] and "--proxy" in calls[1]
+
+    calls = _fake_ytdlp(monkeypatch, [(1, "ERROR: Unsupported URL: https://example.com")])
+    with pytest.raises(RuntimeError, match="Unsupported URL"):
+        av.download_video("https://example.com/v", str(tmp_path))
+    assert len(calls) == 1
+
+
+def test_proxy_secret_scrubbed_from_errors(tmp_path, monkeypatch):
+    proxy = "http://user:secret@proxy:8000"
+    monkeypatch.setenv("YTDLP_PROXY", proxy)
+    _fake_ytdlp(monkeypatch, [(1, f"ERROR: Unable to connect to proxy {proxy}")])
+    with pytest.raises(RuntimeError) as e:
+        av.download_video("https://youtu.be/abc", str(tmp_path))
+    assert "secret" not in str(e.value)
+
+
+def test_no_proxy_means_direct(tmp_path, monkeypatch):
+    monkeypatch.delenv("YTDLP_PROXY", raising=False)
+    (tmp_path / "video_download.mp4").write_bytes(b"x")
+    calls = _fake_ytdlp(monkeypatch, [(0, "")])
+    av.download_video("https://www.instagram.com/reel/abc/", str(tmp_path))
+    assert "--proxy" not in calls[0] and "res:720,ext:mp4:m4a" in calls[0]

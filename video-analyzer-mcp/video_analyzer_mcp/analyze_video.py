@@ -290,9 +290,53 @@ def _ytdlp_error(stderr: str) -> str:
     return (errors or lines or ["yt-dlp exited with an error"])[-1][:500]
 
 
+# Sites that block datacenter IPs (Railway, AWS, ...) outright: go straight
+# through the proxy when one is configured.
+_PROXY_FIRST_HOSTS = ("youtube.com", "youtu.be", "instagram.com")
+_BLOCK_MARKERS = ("not a bot", "sign in to confirm", "login page", "rate-limit",
+                  "rate limit", "http error 403", "http error 429", "log in", "login required")
+
+
+def _host_matches(url: str, hosts: tuple) -> bool:
+    from urllib.parse import urlparse
+    host = (urlparse(url if "://" in url else "https://" + url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def _looks_blocked(error: str) -> bool:
+    e = error.lower()
+    return any(m in e for m in _BLOCK_MARKERS)
+
+
+def _ytdlp_download(url: str, output_path: str, proxy: Optional[str],
+                    cookies_file: Optional[str]) -> tuple[bool, str, str]:
+    """One yt-dlp run that prints the title and downloads. Returns (ok, title, error)."""
+    # Through a (per-GB billed) proxy, 480p is plenty for frame analysis.
+    height = 480 if proxy else 720
+    cmd = ["yt-dlp", "--no-warnings", "--no-update", "--no-playlist",
+           "--retries", "3", "--extractor-retries", "2", "--socket-timeout", "30",
+           "-S", f"res:{height},ext:mp4:m4a",
+           "--merge-output-format", "mp4",
+           "--print", "before_dl:%(title)s", "--no-simulate",
+           "-o", output_path]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if cookies_file and os.path.exists(cookies_file):
+        cmd += ["--cookies", cookies_file]
+    result = subprocess.run(cmd + [url], capture_output=True, text=True)
+    title = next((l.strip() for l in result.stdout.splitlines() if l.strip()), "video")
+    error = _ytdlp_error(result.stderr) if result.returncode != 0 else ""
+    if proxy:
+        error = error.replace(proxy, "[proxy]")
+    return result.returncode == 0, title, error
+
+
 def download_video(url: str, output_dir: str, cookies_file: Optional[str] = None, verbose: bool = False) -> tuple[str, str]:
     """
     Download video from URL using yt-dlp.
+
+    With YTDLP_PROXY set, YouTube and Instagram go through the proxy; other
+    sites try directly and fall back to the proxy if they look blocked.
 
     Returns:
         Tuple of (video_path, video_title)
@@ -300,43 +344,20 @@ def download_video(url: str, output_dir: str, cookies_file: Optional[str] = None
     if verbose:
         print(f"Downloading video from: {url}")
 
-    # Build base command with optional cookies / proxy
-    base_cmd = ["yt-dlp", "--no-warnings", "--no-update"]
-    proxy = os.environ.get("YTDLP_PROXY")
-    if proxy:
-        base_cmd.extend(["--proxy", proxy])
-    if cookies_file and os.path.exists(cookies_file):
-        base_cmd.extend(["--cookies", cookies_file])
-        if verbose:
-            print(f"Using cookies from: {cookies_file}")
+    # A safe filename avoids FFmpeg issues with special characters
+    output_path = os.path.join(output_dir, "video_download.mp4")
+    proxy = os.environ.get("YTDLP_PROXY") or None
 
-    # First get the title
-    title_result = subprocess.run(
-        base_cmd + ["--get-title", "--no-playlist", url],
-        capture_output=True,
-        text=True,
-    )
-    if title_result.returncode != 0:
-        raise RuntimeError(f"Download failed: {_ytdlp_error(title_result.stderr)}")
-    title = title_result.stdout.strip().splitlines()[0] if title_result.stdout.strip() else "video"
-
-    # Download the video with a safe filename to avoid FFmpeg issues with special chars
-    safe_filename = "video_download.mp4"
-    output_path = os.path.join(output_dir, safe_filename)
-    # 720p is plenty for frame analysis and keeps downloads fast
-    result = subprocess.run(
-        base_cmd + [
-            "-f", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/b",
-            "-o", output_path,
-            "--no-playlist",
-            "--merge-output-format", "mp4",
-            url
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Download failed: {_ytdlp_error(result.stderr)}")
+    if proxy and _host_matches(url, _PROXY_FIRST_HOSTS):
+        ok, title, error = _ytdlp_download(url, output_path, proxy, cookies_file)
+    else:
+        ok, title, error = _ytdlp_download(url, output_path, None, cookies_file)
+        if not ok and proxy and _looks_blocked(error):
+            if verbose:
+                print("Direct download blocked; retrying through the proxy")
+            ok, title, error = _ytdlp_download(url, output_path, proxy, cookies_file)
+    if not ok:
+        raise RuntimeError(f"Download failed: {error}")
 
     if os.path.exists(output_path):
         return output_path, title
@@ -982,14 +1003,22 @@ _FF_REAL_ENV_CUES = [
 ]
 
 _FF_DATA_PRESENTATION_CUES = [
-    "chart", "graph", "formula", "timeline", "bullet list", "title card",
+    "chart", "graph", "formula", "timeline", "bullet list",
     "slide", "diagram", "ui element", "ui screen", "phone screen",
-    "app screen", "browser", "dashboard", "logo", "seal", "infographic",
+    "app screen", "browser", "dashboard", "seal", "infographic",
     "statistics", "percentage", "data visualization", "bar chart",
     "pie chart", "calculator",
+    # "title card" and "logo" removed: trailers, Reels and TikToks nearly all
+    # open/close on text cards and logos, which say nothing about data.
+    # Matched as whole words (see _FF_DATA_PRESENTATION_RE): "graph" must not
+    # match "motion graphic", "typography" or "photograph".
     # Note: "ui" alone removed — matches "suit". "label" removed — matches
     # "labeled" (e.g. "crate labeled DEBT").  Use specific multi-word forms.
 ]
+
+_FF_DATA_PRESENTATION_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in _FF_DATA_PRESENTATION_CUES) + r")s?\b"
+)
 
 _FF_CTA_SOCIAL_CUES_REGEX = re.compile(
     r'\b(?:subscribe|comment|follow|share|part\s*[12]|link in bio)\b',
@@ -1191,7 +1220,7 @@ def analyze_stylistic_fingerprint(
     r_photoreal   = _shot_ratio(_FF_PHOTOREAL_CUES)
     r_abstract_bg = _shot_ratio(_FF_ABSTRACT_BG_CUES)
     r_real_env    = _shot_ratio(_FF_REAL_ENV_CUES)
-    r_data_pres   = _shot_ratio(_FF_DATA_PRESENTATION_CUES)
+    r_data_pres   = sum(1 for v in visual_list if _FF_DATA_PRESENTATION_RE.search(v)) / total
     r_symbolism   = _shot_ratio(_FF_SYMBOLISM_CUES)
     r_analogy     = _shot_ratio(_FF_OBJECT_ANALOGY_CUES)
     r_mascot      = _shot_ratio(_FF_MASCOT_CUES)
@@ -1243,7 +1272,7 @@ def analyze_stylistic_fingerprint(
 
     # Co-occurrence: shots that have BOTH abstract bg AND data cues
     _hits_abstract = _shot_hits(_FF_ABSTRACT_BG_CUES)
-    _hits_data     = _shot_hits(_FF_DATA_PRESENTATION_CUES)
+    _hits_data     = [bool(_FF_DATA_PRESENTATION_RE.search(v)) for v in visual_list]
     _hits_env      = _shot_hits(_FF_REAL_ENV_CUES)
     _hits_3d       = _shot_hits(_FF_3D_CUES)
     _hits_2d       = _shot_hits(_FF_2D_BROAD)

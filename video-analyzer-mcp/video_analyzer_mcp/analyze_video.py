@@ -747,7 +747,7 @@ This is a {format_note} video frame.
 {framing_guidance}
 
 Write a prompt that would generate this exact image. Include:
-- Art style (2D animation, 3D render, realistic, cartoon, etc.)
+- Medium first: begin with exactly one of "Live-action footage", "3D render", "2D animation", "Motion graphics", "Illustration", "Screen recording", "Still photo" or "Text card", then the art style details
 - Setting/environment with specific details
 - Characters: age, appearance, clothing, pose, expression, action
 - Lighting and mood
@@ -965,6 +965,18 @@ _FF_2D_LINEART_CUES = [
     "black line", "simple black", "crumpled paper",
 ]
 
+# Filmed footage (TikTok, Reels, vlogs, YouTube): matched as phrases, and a
+# shot only counts when it doesn't also mention animation or rendering.
+_FF_LIVE_ACTION_RE = re.compile(
+    r"\blive[- ]action\b|\breal(?:istic)? (?:photo|footage|video)\b|\bfilmed\b"
+    r"|\b(?:phone|smartphone|handheld|vlog|selfie) (?:footage|video|shot)\b|\bsmartphone\b"
+    r"|\bselfie\b|\bvlog\b|\bphoto style\b|\bphotographic\b|\bdocumentary footage\b"
+)
+_FF_ANIMATED_RE = re.compile(
+    r"\b(?:3d|3-d|cgi|render(?:ed)?|animat\w*|cartoon|illustrat\w*|2d|vector|anime|pixar"
+    r"|drawn|claymation|motion graphics?)\b"
+)
+
 _FF_2D_TEXTURED_CUES = [
     "watercolor", "cross-hatching", "crosshatch", "crosshatching",
     "engraving", "victorian", "ink wash", "etched", "woodcut",
@@ -1040,6 +1052,8 @@ _FF_OBJECT_ANALOGY_CUES = [
 _FF_MASCOT_CUES = [
     "monkey", "duck", "bear", "bunny", "rabbit", "fox", "penguin",
     "mascot", "anthropomorphic", "animal character",
+    # Pets carry many social videos the way mascots carry explainers
+    "dog", "puppy", "kitten",
 ]
 
 _FF_HUMAN_CHARACTER_CUES = [
@@ -1293,9 +1307,16 @@ def analyze_stylistic_fingerprint(
     # ══════════════════════════════════════════════════════════════════
     # Priority order with hard thresholds, then soft-score fallback.
     rendering_class = None
+    r_live = sum(
+        1 for v in visual_list
+        if _FF_LIVE_ACTION_RE.search(v) and not _FF_ANIMATED_RE.search(v)
+    ) / total
 
+    # Live action: mostly filmed footage (social video, vlogs, interviews)
+    if r_live >= 0.50:
+        rendering_class = "Live Action (filmed footage)"
     # Mixed Media: significant BOTH 3D and 2D signals, neither dominant
-    if (r_3d >= 0.20 and r_2d_broad >= 0.20
+    elif (r_3d >= 0.20 and r_2d_broad >= 0.20
             and r_3d < 0.60 and r_2d_broad < 0.60):
         rendering_class = "Mixed Media (2D + 3D)"
     # 3D dominant
@@ -1363,7 +1384,7 @@ def analyze_stylistic_fingerprint(
     # ── Identity detection: find DISTINCT characters ──
     _identity_patterns = [
         # Named species/role labels
-        r'(?:monkey|duck|bear|bunny|rabbit|fox|penguin)'
+        r'(?:monkey|duck|bear|bunny|rabbit|fox|penguin|dog|puppy|kitten)'
         r'\s*(?:mascot|banker|professor|teacher|character)?',
         # Specific identity: adjective + noun combos that recur
         r'(?:young |little |old |teenage |elderly )?'

@@ -705,3 +705,45 @@ def test_trailer_title_cards_are_not_data():
     assert fp["world_type"] == "Stylized Real-World"
     assert fp["narrative_structure"] != "Data-Driven / Analytical"
     assert fp["tonal_positioning"] == "Child-Friendly / Whimsical"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FIXTURE: a TikTok pet video (yt-dlp's TikTok test URL), described by the
+# hosted pipeline. Filmed phone footage, a dog in most shots.
+# ══════════════════════════════════════════════════════════════════════════
+TIKTOK_PET_DESCS = [
+    "Realistic photo style. Small fluffy black-and-white Pomeranian-husky mix with eyes squinted, mouth open, pink tongue out, wearing a pink collar with gold star tag, standing on a tan leather boat seat. Calm teal ocean, overcast cloudy sky, soft diffused daylight. Full body, vertical framing.",
+    "Realistic photo style, vertical high-angle shot. A manatee's gray, barnacle-speckled head and snout break the surface of calm green marina water. Concrete seawall and docks reflect in the ripples. A teak boat deck edge sits in the foreground, with an outboard motor at right. Soft overcast daylight.",
+    "Realistic photo style. Sunny tropical poolside patio with tan tile edge, palm tree, thatched tiki hut roof, wooden post, green shrubs, blue sky. Fluffy black-and-white Pomeranian puppy in pink patterned harness with gold bone tag, walking toward camera, licking nose, pink tongue out. Bright natural daylight. Full body shot.",
+    "Realistic photo style. High angle view of a tan nurse shark swimming near the surface of deep teal ocean water, sunlight sparkling on ripples. A white boat hull edge sits at the lower right. A person's dark-skinned leg and red-black sneaker enter at the upper right, touching the shark's tail. Bright daylight.",
+    "Realistic photo style. Boat deck interior with tan leather bench seats, turquoise sea in the corner, teak flooring. Fluffy black-and-white Pomeranian puppy with a pink collar, head tilted, paws draped over the seat edge, yellow cooling towel on its back. Bright natural daylight. Vertical medium shot.",
+    "Realistic photo style. Sunny backyard poolside, turquoise water, tan stone coping. Fluffy gray-and-white Pomeranian-husky mix stands on pool edge facing camera, mouth open in a happy smile, wearing a pink bandana and tropical palm-print dress with pink bows, a tag on its collar. Bright daylight. Full body, slightly high angle.",
+    "Realistic handheld smartphone footage style. Stormy open ocean seen from a boat deck, cream-colored fiberglass railing in the lower foreground. A large white wave spray bursts upward beside the hull over dark teal choppy water. Overcast gray sky, misty horizon, tilted camera angle, moody cold lighting.",
+    "Realistic photo style, vertical low-angle shot at water level. Turquoise swimming pool with a splashing water jet frozen mid-air, droplets scattering. Background: thatched tiki hut, tropical plants, white house with windows, pink, orange, and purple pool floats. Bright sunny daylight, blue sky.",
+    "Realistic photo style, slight motion blur. Fluffy black-and-white Pomsky puppy with pale blue eyes trots toward camera along a gray stone pool edge, pink tongue out, tail blurred. Turquoise pool with pink floats, thatched tiki hut, tall palm trees, cloudy blue sky. Low angle, full body.",
+    "Realistic photo style. Tropical poolside patio with a thatched tiki hut, palm trees, and turquoise pool with pink pool noodles under a cloudy blue sky. Fluffy black, white, and tan Pomeranian-husky mix puppy trots toward the camera along a stone pool edge, tongue out, tail blurred mid-wag. Low angle, full body.",
+    "Realistic photo style. Extreme close-up of a pale hand with fingers outstretched, skimming turquoise pool water on the left. Water splashes and ripples in a translucent arc around the fingertips, with small droplets and bubbles. Bright sunlight, sparkling highlights, fresh aqua tones.",
+    "Realistic smartphone-video style. Boat deck under overcast pale blue sky, distant sandy shoreline. Fluffy black-and-white Pomeranian-husky puppy with pink collar and gold tag sits on beige cushioned seat, eyes squinting, tongue out happily. A hand holds a spiny orange-and-white lionfish toward the dog. Soft diffused daylight. Medium shot.",
+    "Realistic photo style. Boat deck with tan cushioned seats under a cloudy blue-gray sky. Fluffy black-and-white husky-Pomeranian puppy in a pink collar with a tag sits upright, eyes squinted, mouth open with pink tongue out. A hand holds a orange-mottled wrasse fish with spiny dorsal fins toward the puppy. Soft overcast daylight.",
+    "Heavy horizontal motion-blur photograph, vertical frame. Blurred figure with long dark hair and a teal top, tilted skin-toned shoulder and neck diagonal across the center. Green palm foliage behind, bright blue sky at right, pink object in the bottom corner. Bright daylight, abstract streaked, out-of-focus look.",
+    "Realistic smartphone-style photo, tilted dutch angle, low water-level view. A fluffy white dog in a pink and black harness swims in a turquoise pool, splashing water droplets. Blue geometric mosaic tile wall, tan pool railing, green plants and white beach house behind. Bright sunny blue sky.",
+    "Realistic photo style. Close-up of a fluffy Pomsky puppy with gray-black fur, white cream eyebrow markings, white muzzle and chest, black nose, and dark blue eyes. Mouth open in a happy smile, pink tongue out, pink collar visible. Blurred cream boat seat and cloudy blue-gray sky behind. Soft overcast daylight.",
+    "Realistic blurred motion photo, handheld smartphone look. View from a fast-moving boat's cream-white deck edge with tan trim, dark green choppy sea spraying white foam and mist, hazy gray-blue horizon, small dark object on the gunwale. Overcast diffuse daylight, strong motion blur, high angle.",
+    "Realistic photographic style. High-angle view from a cream-colored fiberglass motorboat's bow, white gunwale and tan rail curving in the lower right. Choppy dark teal ocean with white foamy wake, distant horizon, heavy gray storm clouds overhead. Moody, overcast lighting. No people.",
+    "Realistic photo style. Sunny tropical walkway with beige tiles, palm trees, and a blue sky behind. Fluffy black, white, and tan Pomeranian puppy in a red paw-print life vest stands facing the camera, licking its nose with its pink tongue out. Bright daylight. Low-angle close-up."
+]
+
+
+def test_tiktok_live_action_pet():
+    fp = analyze_stylistic_fingerprint(
+        _make_shots(TIKTOK_PET_DESCS, 0.55), [], 10.5, orientation="vertical",
+        reading_level="Grade 1")
+    assert fp["rendering_class"] == "Live Action (filmed footage)"
+    assert fp["character_strategy"].startswith("Mascot-Led")
+    assert fp["visual_abstraction_index"].startswith("1")
+
+
+def test_live_action_needs_unanimated_shots():
+    descs = ["3D animated render of a realistic photo style kitchen."] * 4
+    fp = analyze_stylistic_fingerprint(_make_shots(descs), [], 8.0)
+    assert fp["rendering_class"] != "Live Action (filmed footage)"

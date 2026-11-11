@@ -335,14 +335,18 @@ def shrink_jpeg(path: str, max_width: int = 1100, max_bytes: int = 90_000) -> by
     from PIL import Image as PILImage
 
     img = PILImage.open(path).convert("RGB")
-    if img.width > max_width:
-        img = img.resize((max_width, int(img.height * max_width / img.width)))
-    for quality in (75, 60, 45):
+    # Cap the longest side: a sheet of vertical (TikTok/Reels) shots is tall.
+    scale = min(1.0, max_width / max(img.width, img.height))
+    if scale < 1.0:
+        img = img.resize((int(img.width * scale), int(img.height * scale)))
+    for quality in (75, 65, 55, 50, 45, 45):
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=quality, optimize=True)
         if buf.tell() <= max_bytes:
             return buf.getvalue()
-        img = img.resize((int(img.width * 0.8), int(img.height * 0.8)))
+        if max(img.width, img.height) < 500:
+            break
+        img = img.resize((int(img.width * 0.85), int(img.height * 0.85)))
     return None
 
 

@@ -2,37 +2,50 @@
 
 <!-- mcp-name: io.github.BrightWayAI/video-analyzer -->
 
-An MCP (Model Context Protocol) server that analyzes videos and generates storyboard breakdowns. Extract frames, transcribe audio, analyze visuals with Claude Vision, and compute stylistic fingerprints — all usable directly from Claude Desktop or Claude Code.
+**Turn any video link into a shot-by-shot storyboard.** Every scene's frame, a Claude Vision description of it, the line spoken over it, and an eight-field stylistic fingerprint of the whole video, from one request to your AI assistant.
+
+[![Video Analyzer MCP server](https://mcprush.com/badge/brightwayai-video-analyzer-mcp/card.svg)](https://mcprush.com/to/brightwayai-video-analyzer-mcp?ref=badge)
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/BrightWayAI/video-analyzer/main/docs/example-contact-sheet.jpg" width="560" alt="Contact sheet of all 27 shots found in the Big Buck Bunny trailer">
+  <br>
+  <sub>27 shots found in the 33-second <i>Big Buck Bunny</i> trailer. © Blender Foundation, CC BY 3.0.</sub>
+</p>
+
+More examples, who it's for and how it works: [the project README on GitHub](https://github.com/BrightWayAI/video-analyzer#readme).
 
 ## Tools
 
-| Tool | Description |
+| Tool | What it does |
 |------|-------------|
-| `video_analyze` | Full pipeline: download, extract frames, transcribe, visual analysis, stylistic fingerprint, storyboard document |
-| `video_extract_frames` | Extract representative frames using scene detection or fixed intervals |
-| `video_transcribe` | Transcribe audio with OpenAI Whisper (timestamped, speaker-labeled) |
-| `video_fingerprint` | Generate an 8-field Stylistic Fingerprint v3 classification |
-| `video_check_deps` | Verify all required dependencies are installed |
+| `video_analyze` | The full breakdown: storyboard, contact sheet, fingerprint, transcript, Word file and frames |
+| `video_extract_frames` | One frame per shot via scene detection (or fixed intervals), fast, no AI write-up |
+| `video_transcribe` | Timestamped transcript (Whisper, runs locally, no OpenAI key) |
+| `video_fingerprint` | Just the eight-field stylistic classification |
+| `video_check_deps` | Checks FFmpeg, Whisper and friends are installed (self-hosted only) |
 
-## Prerequisites
+## Hosted: nothing to install
 
-- **Python 3.10+**
-- **FFmpeg** — `brew install ffmpeg` (macOS) or `apt-get install ffmpeg` (Linux)
-- **ANTHROPIC_API_KEY** — set as an environment variable
+Subscribe on [mcprush](https://mcprush.com/to/brightwayai-video-analyzer-mcp?ref=badge) and add it to any MCP client. No API keys, FFmpeg or Python on your side; YouTube, Shorts, TikTok and direct links work.
 
-## Installation
+## Run it yourself
 
-### From GitHub
+Needs **Python 3.10+**, **FFmpeg** (`brew install ffmpeg` or `apt-get install ffmpeg`) and your own **`ANTHROPIC_API_KEY`**.
+
+Install from GitHub for now: version 0.1.2 on PyPI installs mcp 2.x and crashes on startup.
 
 ```bash
 pip install "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp"
 ```
 
-Install from GitHub for now: version 0.1.2 on PyPI installs mcp 2.x and crashes on startup.
+**Claude Code**
 
-### For Claude Desktop
+```bash
+claude mcp add video-analyzer -s user -e ANTHROPIC_API_KEY=sk-ant-... -- \
+  uvx --from "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp" video-analyzer-mcp
+```
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Claude Desktop**: add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
 {
@@ -40,29 +53,18 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
     "video-analyzer": {
       "command": "uvx",
       "args": ["--from", "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp", "video-analyzer-mcp"],
-      "env": {
-        "ANTHROPIC_API_KEY": "your-key-here"
-      }
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
     }
   }
 }
 ```
 
-### For Claude Code
+Then ask your assistant:
 
-```bash
-claude mcp add video-analyzer -s user -- uvx --from "git+https://github.com/BrightWayAI/video-analyzer#subdirectory=video-analyzer-mcp" video-analyzer-mcp
-```
-
-## Usage Examples
-
-Once installed, you can ask Claude:
-
-- **"Analyze this video and create a storyboard"** — runs `video_analyze`
-- **"Extract frames from this YouTube video"** — runs `video_extract_frames`
-- **"Transcribe the audio from this video"** — runs `video_transcribe`
-- **"What's the stylistic fingerprint of this video?"** — runs `video_fingerprint`
-- **"Check if video analyzer dependencies are installed"** — runs `video_check_deps`
+- *"Break this video down into a storyboard: <link>"* → `video_analyze`
+- *"Pull one frame per shot from this TikTok"* → `video_extract_frames`
+- *"Transcribe this video"* → `video_transcribe`
+- *"What's the visual style of this video?"* → `video_fingerprint`
 
 ## Hosted mode (remote HTTP)
 
@@ -70,7 +72,7 @@ Once installed, you can ask Claude:
 
 - answers only requests with a valid `x-mcprush-token` header and returns 401 to everything else
 - accepts public `http(s)` video URLs only (no local paths, cookies files or output directories) and rejects private or local addresses
-- returns the storyboard as Markdown inline and keeps nothing on disk
+- returns results inline and serves its files (storyboard .docx, contact sheet, frames) behind unguessable links that expire
 - caps video length and the number of jobs that run at once
 
 ```bash
@@ -107,16 +109,23 @@ Hosted results: `video_analyze` returns a JSON summary (with the fingerprint and
 
 ## Stylistic Fingerprint Fields
 
-The fingerprint classifier produces 8 deterministic fields:
+A deterministic classifier over the shot descriptions and transcript, so the same video always gets the same labels.
 
-1. **Rendering Class** — Stylized 3D, Flat 2D, Minimalist Line Art, Textured 2D, Mixed Media, Photoreal
-2. **World Type** — Stylized Real-World, Abstract Concept Space, Data/Presentation Space, Fictional Metaphor Universe
-3. **Character Strategy** — None, Mascot-Led, Single Narrator, Single Protagonist Arc, Ensemble Cast
-4. **Narrative Structure** — Direct Explanation, Step-by-Step, Problem-Solution, Analogy, Myth-Busting, etc.
-5. **Visual Abstraction Index** — 1 (Photorealistic) to 5 (Maximum Abstraction)
-6. **Visual Density** — Minimal, Sparse, Moderate, High
-7. **Camera/Editing Language** — Cinematic, Social Vertical Punch, Presentation Deck, Static Slides, etc.
-8. **Tonal Positioning** — Institutional, Corporate Professional, Gen Z Social, Child-Friendly, Dark Editorial
+1. **Rendering Class**: Live Action, Stylized 3D, Photoreal 3D, Flat 2D, Minimalist Line Art, Textured 2D, Mixed Media
+2. **World Type**: Real-World Literal, Stylized Real-World, Abstract Concept Space, Data/Presentation Space, Fictional Metaphor Universe
+3. **Character Strategy**: None, Mascot-Led, Single Narrator, Single Protagonist Arc, Ensemble Cast
+4. **Narrative Structure**: Direct Explanation, Step-by-Step, Problem → Solution, Analogy, Myth-Busting, Listicle, Character Journey, …
+5. **Visual Abstraction Index**: 1 (Photorealistic) to 5 (Maximum Abstraction)
+6. **Visual Density**: Minimal, Sparse, Moderate, High
+7. **Camera/Editing Language**: Cinematic, Social Vertical Punch, Presentation Deck, Dynamic, Static Slides, …
+8. **Tonal Positioning**: Institutional, Corporate Professional, Gen Z Social, Child-Friendly, Dark Editorial
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
 
 ## License
 

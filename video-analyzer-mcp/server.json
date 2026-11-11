@@ -1,13 +1,13 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.BrightWayAI/video-analyzer",
-  "description": "Analyze videos: extract frames, transcribe audio, generate storyboard breakdowns.",
-  "version": "0.1.3",
+  "description": "Turn any video link into a shot-by-shot storyboard: frames, transcript and a style fingerprint.",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "video-analyzer-mcp",
-      "version": "0.1.3",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       }
@@ -20,23 +20,23 @@
   "tools": [
     {
       "name": "video_analyze",
-      "description": "Run full video analysis pipeline: download, extract frames, transcribe, visual analysis, fingerprint, storyboard output"
+      "description": "Full breakdown: shot-by-shot storyboard with frames, Claude Vision descriptions, transcript, contact sheet and stylistic fingerprint"
     },
     {
       "name": "video_extract_frames",
-      "description": "Extract representative frames using scene detection or fixed intervals"
+      "description": "Extract one representative frame per shot using scene detection (or fixed intervals)"
     },
     {
       "name": "video_transcribe",
-      "description": "Transcribe video audio with OpenAI Whisper"
+      "description": "Timestamped transcript of a video's audio (Whisper, runs locally)"
     },
     {
       "name": "video_fingerprint",
-      "description": "Generate 8-field Stylistic Fingerprint v3 classification"
+      "description": "8-field Stylistic Fingerprint v3: rendering, world, characters, narrative, abstraction, density, editing, tone"
     },
     {
       "name": "video_check_deps",
-      "description": "Verify all required dependencies are installed"
+      "description": "Verify FFmpeg, Whisper and the other local dependencies are installed (local installs only)"
     }
   ]
 }

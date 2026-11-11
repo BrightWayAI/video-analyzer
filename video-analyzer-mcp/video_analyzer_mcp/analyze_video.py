@@ -308,6 +308,28 @@ def _looks_blocked(error: str) -> bool:
     return any(m in e for m in _BLOCK_MARKERS)
 
 
+def _sticky_proxy(proxy: str) -> str:
+    """Keep one exit IP for the whole download. Rotating residential proxies
+    switch IP per request, but YouTube's media links only work from the IP
+    that asked for them. Oxylabs takes the session in the username; other
+    providers usually give a sticky URL directly, so leave those alone."""
+    import secrets
+    from urllib.parse import urlsplit, urlunsplit, quote
+
+    parts = urlsplit(proxy)
+    host = (parts.hostname or "").lower()
+    if not host.endswith("oxylabs.io") or not parts.username or "sessid-" in parts.username:
+        return proxy
+    user = parts.username
+    if not user.startswith("customer-"):
+        user = "customer-" + user
+    user += f"-sessid-{secrets.token_hex(5)}-sesstime-10"
+    netloc = f"{quote(user, safe='-_.')}:{parts.password or ''}@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme or "http", netloc, parts.path, parts.query, parts.fragment))
+
+
 def _ytdlp_download(url: str, output_path: str, proxy: Optional[str],
                     cookies_file: Optional[str]) -> tuple[bool, str, str]:
     """One yt-dlp run that prints the title and downloads. Returns (ok, title, error)."""
@@ -320,7 +342,7 @@ def _ytdlp_download(url: str, output_path: str, proxy: Optional[str],
            "--print", "before_dl:%(title)s", "--no-simulate",
            "-o", output_path]
     if proxy:
-        cmd += ["--proxy", proxy]
+        cmd += ["--proxy", _sticky_proxy(proxy)]
     if cookies_file and os.path.exists(cookies_file):
         cmd += ["--cookies", cookies_file]
     result = subprocess.run(cmd + [url], capture_output=True, text=True)
@@ -328,6 +350,9 @@ def _ytdlp_download(url: str, output_path: str, proxy: Optional[str],
     error = _ytdlp_error(result.stderr) if result.returncode != 0 else ""
     if proxy:
         error = error.replace(proxy, "[proxy]")
+        pw = __import__("urllib.parse").parse.urlsplit(proxy).password
+        if pw:
+            error = error.replace(pw, "[hidden]")
     return result.returncode == 0, title, error
 
 

@@ -434,3 +434,13 @@ def test_no_proxy_means_direct(tmp_path, monkeypatch):
     calls = _fake_ytdlp(monkeypatch, [(0, "")])
     av.download_video("https://www.instagram.com/reel/abc/", str(tmp_path))
     assert "--proxy" not in calls[0] and "res:720,ext:mp4:m4a" in calls[0]
+
+
+def test_oxylabs_proxy_gets_sticky_session():
+    out = av._sticky_proxy("http://myuser:pa55@pr.oxylabs.io:7777")
+    assert out.startswith("http://customer-myuser-sessid-") and out.endswith("-sesstime-10:pa55@pr.oxylabs.io:7777")
+    assert av._sticky_proxy("http://myuser:pa55@pr.oxylabs.io:7777") != out  # new session per download
+    already = "http://customer-u-sessid-abc-sesstime-10:p@pr.oxylabs.io:7777"
+    assert av._sticky_proxy(already) == already
+    other = "http://u:p@geo.iproyal.com:12321"
+    assert av._sticky_proxy(other) == other

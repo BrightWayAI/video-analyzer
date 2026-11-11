@@ -256,12 +256,20 @@ class _Progress:
 
     async def run(self, fn, *args, **kwargs):
         """Run blocking fn in a worker thread with the heartbeat going."""
+        # Catch inside the task group so a failure surfaces as itself rather
+        # than wrapped in an ExceptionGroup ("unhandled errors in a TaskGroup").
+        result, error = None, None
         async with anyio.create_task_group() as tg:
             tg.start_soon(self._beat)
             try:
-                return await _run(fn, *args, **kwargs)
+                result = await _run(fn, *args, **kwargs)
+            except Exception as e:
+                error = e
             finally:
                 tg.cancel_scope.cancel()
+        if error is not None:
+            raise error
+        return result
 
 
 def _fail(e: Exception) -> None:

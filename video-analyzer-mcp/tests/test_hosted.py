@@ -164,6 +164,19 @@ def test_progress_sends_total_not_message():
     assert sent == [(0.3, 1.0, "Transcribing")]
 
 
+def test_progress_run_raises_original_error():
+    from video_analyzer_mcp.server import _Progress
+
+    async def report_progress(*a, **k):
+        pass
+
+    def boom():
+        raise RuntimeError("Download failed: Sign in to confirm you're not a bot")
+
+    with pytest.raises(RuntimeError, match="Download failed"):
+        asyncio.run(_Progress(SimpleNamespace(report_progress=report_progress)).run(boom))
+
+
 class _FakeMessages:
     def __init__(self, stop="end_turn"):
         self.kwargs = None
